@@ -409,11 +409,14 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
             // Section headers get special rendering
             if let FetchResult::Section(ref title) = result {
                 println!();
-                println!(
-                    "  {} {}",
-                    "─".repeat(3).dimmed(),
-                    title.bold()
-                );
+                let styled_title = match title.as_str() {
+                    // Anthropic brand color #D97757
+                    "Claude Code" => format!("  ─── {}", title.truecolor(217, 119, 87).bold()),
+                    // Codex = white
+                    "Codex" => format!("  ─── {}", title.white().bold()),
+                    _ => format!("  ─── {}", title.bold()),
+                };
+                println!("{}", styled_title);
                 displayed_up_to += 1;
                 continue;
             }

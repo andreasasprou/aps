@@ -90,7 +90,17 @@ pub fn render_profile_header_with_tool(
     label: &str,
     is_active: bool,
 ) {
-    let plan_badge = format!(" {} ", plan.to_uppercase()).on_yellow().black().bold();
+    // Claude = Anthropic brand terracotta #D97757, Codex = yellow
+    let plan_badge = match tool {
+        "claude" => format!(" {} ", plan.to_uppercase())
+            .on_truecolor(217, 119, 87)
+            .white()
+            .bold(),
+        _ => format!(" {} ", plan.to_uppercase())
+            .on_yellow()
+            .black()
+            .bold(),
+    };
     let email_display = format!("  {}  ", email).on_bright_black().white();
     let label_display = if !label.is_empty() {
         format!("  {}  ", label).on_bright_black().white().to_string()
@@ -99,7 +109,17 @@ pub fn render_profile_header_with_tool(
     };
 
     let active_marker = if is_active {
-        format!("  <- active ({})", tool).green().bold().to_string()
+        let marker_text = match tool {
+            "claude" => format!("  <- active ({})", tool)
+                .truecolor(217, 119, 87)
+                .bold()
+                .to_string(),
+            _ => format!("  <- active ({})", tool)
+                .green()
+                .bold()
+                .to_string(),
+        };
+        marker_text
     } else {
         String::new()
     };
