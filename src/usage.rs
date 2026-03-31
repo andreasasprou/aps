@@ -38,16 +38,36 @@ pub struct ExtraUsage {
     pub currency: Option<String>,
 }
 
-fn fetch_claude_usage(access_token: &str) -> Result<ClaudeUsageResponse> {
-    let resp = ureq::get("https://api.anthropic.com/api/oauth/usage")
-        .set("Authorization", &format!("Bearer {}", access_token))
-        .set("anthropic-beta", "oauth-2025-04-20")
-        .set("User-Agent", "claude-code/2.1.0")
-        .set("Accept", "application/json")
-        .call()
-        .context("Failed to fetch Claude usage")?;
-
-    resp.into_json().context("Failed to parse Claude usage response")
+fn fetch_claude_usage_once(access_token: &str) -> Result<ClaudeUsageResponse> {
+    let delays = [0, 2000, 5000]; // retry with backoff on 429
+    for (attempt, delay_ms) in delays.iter().enumerate() {
+        if *delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+        }
+        match ureq::get("https://api.anthropic.com/api/oauth/usage")
+            .set("Authorization", &format!("Bearer {}", access_token))
+            .set("anthropic-beta", "oauth-2025-04-20")
+            .set("User-Agent", "claude-code/2.1.0")
+            .set("Accept", "application/json")
+            .call()
+        {
+            Ok(resp) => return resp.into_json().context("Failed to parse Claude usage response"),
+            Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
+                anyhow::bail!("token_expired")
+            }
+            Err(ureq::Error::Status(429, _)) => {
+                if attempt == delays.len() - 1 {
+                    anyhow::bail!("Rate limited (429). This account may be throttled by Anthropic.")
+                }
+                // retry
+            }
+            Err(ureq::Error::Status(code, _)) => {
+                anyhow::bail!("HTTP {}", code)
+            }
+            Err(e) => return Err(e).context("Failed to fetch Claude usage"),
+        }
+    }
+    unreachable!()
 }
 
 // ─── Codex Usage API ───
@@ -100,8 +120,33 @@ fn fetch_codex_usage(access_token: &str, account_id: Option<&str>) -> Result<Cod
 
 /// What kind of usage to fetch
 enum FetchJob {
-    Claude { access_token: String },
+    Claude { access_token: String, refresh_token: Option<String> },
     Codex { access_token: String, account_id: Option<String> },
+}
+
+/// Try fetch, refresh token on 401/403, retry
+fn fetch_claude_usage_with_refresh(access_token: &str, refresh_token: Option<&str>) -> Result<ClaudeUsageResponse> {
+    match fetch_claude_usage_once(access_token) {
+        Ok(usage) => Ok(usage),
+        Err(e) => {
+            let err_str = format!("{}", e);
+            if err_str.contains("token_expired") {
+                if let Some(rt) = refresh_token {
+                    match auth::refresh_claude_token(rt) {
+                        Ok(refreshed) => fetch_claude_usage_once(&refreshed.access_token),
+                        Err(refresh_err) => anyhow::bail!(
+                            "Token expired and refresh failed: {}. Re-save with `aps save claude`",
+                            refresh_err
+                        ),
+                    }
+                } else {
+                    anyhow::bail!("Token expired (no refresh token). Re-save with `aps save claude`")
+                }
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Result of a parallel fetch, keyed by index for ordered display
@@ -153,9 +198,11 @@ fn status_active_parallel(tools: &[&str]) -> Result<()> {
                             ("(unsaved)".into(), "?".into(), String::new())
                         };
 
+                        let refresh_token = creds.claude_ai_oauth.as_ref()
+                            .and_then(|o| o.refresh_token.clone());
                         jobs.push((
                             ProfileDisplay { tool: "claude".into(), plan, email, label, is_active: true },
-                            FetchJob::Claude { access_token: token },
+                            FetchJob::Claude { access_token: token, refresh_token },
                         ));
                     } else {
                         println!("  claude: {}", "No active auth".dimmed());
@@ -225,10 +272,12 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                 "claude" => {
                     let creds: auth::ClaudeCredentialsFile = serde_json::from_slice(&data)
                         .context(format!("Failed to parse profile {}", id))?;
+                    let refresh_token = creds.claude_ai_oauth.as_ref()
+                        .and_then(|o| o.refresh_token.clone());
                     if let Some(token) = auth::claude_access_token(&creds) {
-                        jobs.push((display, FetchJob::Claude { access_token: token }));
+                        jobs.push((display, FetchJob::Claude { access_token: token, refresh_token }));
                     } else {
-                        jobs.push((display, FetchJob::Claude { access_token: String::new() }));
+                        jobs.push((display, FetchJob::Claude { access_token: String::new(), refresh_token: None }));
                     }
                 }
                 "codex" => {
@@ -258,18 +307,25 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
     let count = jobs.len();
     let (tx, rx) = mpsc::channel::<(usize, FetchResult)>();
 
-    // Spawn all fetches
+    // Spawn all fetches — stagger Claude calls to avoid 429 rate limits
+    let mut claude_idx = 0u64;
     for (idx, (_display, job)) in jobs.iter().enumerate() {
         let tx = tx.clone();
         match job {
-            FetchJob::Claude { access_token } => {
+            FetchJob::Claude { access_token, refresh_token } => {
                 if access_token.is_empty() {
                     let _ = tx.send((idx, FetchResult::Claude(Err(anyhow::anyhow!("No access token")))));
                     continue;
                 }
                 let token = access_token.clone();
+                let rt = refresh_token.clone();
+                let delay_ms = claude_idx * 1000; // stagger 1s between Claude calls to avoid 429
+                claude_idx += 1;
                 thread::spawn(move || {
-                    let result = fetch_claude_usage(&token);
+                    if delay_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
+                    let result = fetch_claude_usage_with_refresh(&token, rt.as_deref());
                     let _ = tx.send((idx, FetchResult::Claude(result)));
                 });
             }
