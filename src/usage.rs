@@ -39,7 +39,7 @@ pub struct ExtraUsage {
 }
 
 fn fetch_claude_usage_once(access_token: &str) -> Result<ClaudeUsageResponse> {
-    let delays = [0, 2000, 5000]; // retry with backoff on 429
+    let delays = [0, 1500]; // one retry on 429
     for (attempt, delay_ms) in delays.iter().enumerate() {
         if *delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
@@ -57,7 +57,7 @@ fn fetch_claude_usage_once(access_token: &str) -> Result<ClaudeUsageResponse> {
             }
             Err(ureq::Error::Status(429, _)) => {
                 if attempt == delays.len() - 1 {
-                    anyhow::bail!("Rate limited (429). This account may be throttled by Anthropic.")
+                    anyhow::bail!("Rate limited. Run `aps load claude` to switch to this account first.")
                 }
                 // retry
             }
@@ -285,11 +285,19 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                             }
                         }
                     }
-                    // Non-active Claude profiles: tokens get invalidated when you switch accounts.
-                    // Claude Code only supports one active account at a time.
-                    jobs.push((display, FetchJob::Inactive {
-                        message: "Run `aps load claude` to switch to this profile and see usage".into(),
-                    }));
+                    // Non-active Claude profiles: try with saved token + refresh.
+                    // Old tokens often get rate-limited (429) after account switch.
+                    let creds: auth::ClaudeCredentialsFile = serde_json::from_slice(&data)
+                        .context(format!("Failed to parse profile {}", id))?;
+                    let refresh_token = creds.claude_ai_oauth.as_ref()
+                        .and_then(|o| o.refresh_token.clone());
+                    if let Some(token) = auth::claude_access_token(&creds) {
+                        jobs.push((display, FetchJob::Claude { access_token: token, refresh_token }));
+                    } else {
+                        jobs.push((display, FetchJob::Inactive {
+                            message: "No access token. Run `aps save claude` after switching to this account.".into(),
+                        }));
+                    }
                 }
                 "codex" => {
                     let auth_data: auth::CodexAuthFile = serde_json::from_slice(&data)
@@ -440,10 +448,11 @@ fn print_claude_usage(usage: &ClaudeUsageResponse, indent: usize) {
         if extra.is_enabled == Some(true) {
             let prefix = " ".repeat(indent);
             let currency = extra.currency.as_deref().unwrap_or("USD");
-            let limit = extra.monthly_limit.unwrap_or(0.0);
-            let used = extra.used_credits.unwrap_or(0.0);
+            // API returns values in cents
+            let limit = extra.monthly_limit.unwrap_or(0.0) / 100.0;
+            let used = extra.used_credits.unwrap_or(0.0) / 100.0;
             println!(
-                "{}Extra credits: {:.2}/{:.2} {} used",
+                "{}Extra credits: ${:.2}/${:.2} {} spent",
                 prefix, used, limit, currency
             );
         }
