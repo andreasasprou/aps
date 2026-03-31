@@ -122,8 +122,9 @@ fn fetch_codex_usage(access_token: &str, account_id: Option<&str>) -> Result<Cod
 enum FetchJob {
     Claude { access_token: String, refresh_token: Option<String> },
     Codex { access_token: String, account_id: Option<String> },
-    /// Non-active Claude profiles can't be fetched (tokens invalidated on switch)
     Inactive { message: String },
+    /// Section divider (not a real fetch)
+    SectionHeader { title: String },
 }
 
 /// Try fetch, refresh token on 401/403, retry
@@ -156,6 +157,7 @@ enum FetchResult {
     Claude(Result<ClaudeUsageResponse>),
     Codex(Result<CodexUsageResponse>),
     Skipped(String),
+    Section(String),
 }
 
 /// Profile header info to display before usage
@@ -258,6 +260,23 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
             println!("  {}: {}", tool, "No saved profiles".dimmed());
             continue;
         }
+
+        // Section header
+        let tool_label = match tool {
+            "claude" => "Claude Code",
+            "codex" => "Codex",
+            t => t,
+        };
+        jobs.push((
+            ProfileDisplay {
+                tool: tool.into(),
+                plan: String::new(),
+                email: String::new(),
+                label: String::new(),
+                is_active: false,
+            },
+            FetchJob::SectionHeader { title: tool_label.to_string() },
+        ));
 
         for (id, meta, is_active) in &all_profiles {
             let label = meta.label.clone().unwrap_or_default();
@@ -364,6 +383,10 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                 let msg = message.clone();
                 let _ = tx.send((idx, FetchResult::Skipped(msg)));
             }
+            FetchJob::SectionHeader { title } => {
+                let t = title.clone();
+                let _ = tx.send((idx, FetchResult::Section(t)));
+            }
         }
     }
     drop(tx); // Close sender so rx iterator ends
@@ -382,6 +405,18 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
             }
             let display = &jobs[displayed_up_to].0;
             let result = results[displayed_up_to].take().unwrap();
+
+            // Section headers get special rendering
+            if let FetchResult::Section(ref title) = result {
+                println!();
+                println!(
+                    "  {} {}",
+                    "─".repeat(3).dimmed(),
+                    title.bold()
+                );
+                displayed_up_to += 1;
+                continue;
+            }
 
             ui::render_profile_header_with_tool(
                 &display.tool,
@@ -403,6 +438,7 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                 FetchResult::Skipped(msg) => {
                     println!("    {}", msg.dimmed());
                 }
+                FetchResult::Section(_) => unreachable!(),
             }
 
             displayed_up_to += 1;
