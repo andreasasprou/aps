@@ -270,6 +270,19 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
 
             match tool {
                 "claude" => {
+                    // For the active Claude profile, use fresh credentials from Keychain
+                    // Saved tokens get invalidated when you switch accounts
+                    if *is_active {
+                        if let Ok(Some(fresh_creds)) = auth::read_claude_credentials() {
+                            let refresh_token = fresh_creds.claude_ai_oauth.as_ref()
+                                .and_then(|o| o.refresh_token.clone());
+                            if let Some(token) = auth::claude_access_token(&fresh_creds) {
+                                jobs.push((display, FetchJob::Claude { access_token: token, refresh_token }));
+                                continue;
+                            }
+                        }
+                    }
+                    // Non-active: use saved credentials + refresh token
                     let creds: auth::ClaudeCredentialsFile = serde_json::from_slice(&data)
                         .context(format!("Failed to parse profile {}", id))?;
                     let refresh_token = creds.claude_ai_oauth.as_ref()
@@ -389,16 +402,17 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
 // ─── Rendering (pure, no fetching) ───
 
 fn print_claude_usage(usage: &ClaudeUsageResponse, indent: usize) {
+    // Claude API returns utilization as percentage (0-100), convert to fraction (0.0-1.0)
     if let Some(ref w) = usage.five_hour {
         if let Some(util) = w.utilization {
             let reset = format_reset_time(w.resets_at.as_deref());
-            ui::render_usage_bar("5 hour", util, &reset, indent);
+            ui::render_usage_bar("5 hour", util / 100.0, &reset, indent);
         }
     }
     if let Some(ref w) = usage.seven_day {
         if let Some(util) = w.utilization {
             let reset = format_reset_time(w.resets_at.as_deref());
-            ui::render_usage_bar("Weekly", util, &reset, indent);
+            ui::render_usage_bar("Weekly", util / 100.0, &reset, indent);
         }
     }
     if let Some(ref w) = usage.seven_day_opus {
@@ -406,7 +420,7 @@ fn print_claude_usage(usage: &ClaudeUsageResponse, indent: usize) {
             let reset = format_reset_time(w.resets_at.as_deref());
             let prefix = " ".repeat(indent);
             println!("{}{}:", prefix, "opus".bold());
-            ui::render_usage_bar("  Weekly", util, &reset, indent);
+            ui::render_usage_bar("  Weekly", util / 100.0, &reset, indent);
         }
     }
     if let Some(ref w) = usage.seven_day_sonnet {
@@ -414,7 +428,7 @@ fn print_claude_usage(usage: &ClaudeUsageResponse, indent: usize) {
             let reset = format_reset_time(w.resets_at.as_deref());
             let prefix = " ".repeat(indent);
             println!("{}{}:", prefix, "sonnet".bold());
-            ui::render_usage_bar("  Weekly", util, &reset, indent);
+            ui::render_usage_bar("  Weekly", util / 100.0, &reset, indent);
         }
     }
     if let Some(ref extra) = usage.extra_usage {
