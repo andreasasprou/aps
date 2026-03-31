@@ -122,6 +122,8 @@ fn fetch_codex_usage(access_token: &str, account_id: Option<&str>) -> Result<Cod
 enum FetchJob {
     Claude { access_token: String, refresh_token: Option<String> },
     Codex { access_token: String, account_id: Option<String> },
+    /// Non-active Claude profiles can't be fetched (tokens invalidated on switch)
+    Inactive { message: String },
 }
 
 /// Try fetch, refresh token on 401/403, retry
@@ -153,6 +155,7 @@ fn fetch_claude_usage_with_refresh(access_token: &str, refresh_token: Option<&st
 enum FetchResult {
     Claude(Result<ClaudeUsageResponse>),
     Codex(Result<CodexUsageResponse>),
+    Skipped(String),
 }
 
 /// Profile header info to display before usage
@@ -282,16 +285,11 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                             }
                         }
                     }
-                    // Non-active: use saved credentials + refresh token
-                    let creds: auth::ClaudeCredentialsFile = serde_json::from_slice(&data)
-                        .context(format!("Failed to parse profile {}", id))?;
-                    let refresh_token = creds.claude_ai_oauth.as_ref()
-                        .and_then(|o| o.refresh_token.clone());
-                    if let Some(token) = auth::claude_access_token(&creds) {
-                        jobs.push((display, FetchJob::Claude { access_token: token, refresh_token }));
-                    } else {
-                        jobs.push((display, FetchJob::Claude { access_token: String::new(), refresh_token: None }));
-                    }
+                    // Non-active Claude profiles: tokens get invalidated when you switch accounts.
+                    // Claude Code only supports one active account at a time.
+                    jobs.push((display, FetchJob::Inactive {
+                        message: "Run `aps load claude` to switch to this profile and see usage".into(),
+                    }));
                 }
                 "codex" => {
                     let auth_data: auth::CodexAuthFile = serde_json::from_slice(&data)
@@ -354,6 +352,10 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                     let _ = tx.send((idx, FetchResult::Codex(result)));
                 });
             }
+            FetchJob::Inactive { message } => {
+                let msg = message.clone();
+                let _ = tx.send((idx, FetchResult::Skipped(msg)));
+            }
         }
     }
     drop(tx); // Close sender so rx iterator ends
@@ -389,6 +391,9 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                 FetchResult::Codex(Ok(usage)) => print_codex_usage(&usage, 4),
                 FetchResult::Codex(Err(e)) => {
                     println!("    {}", format!("Failed to fetch usage: {}", e).red());
+                }
+                FetchResult::Skipped(msg) => {
+                    println!("    {}", msg.dimmed());
                 }
             }
 
