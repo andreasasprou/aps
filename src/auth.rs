@@ -28,14 +28,6 @@ pub struct ClaudeOAuth {
     pub subscription_type: Option<String>,
 }
 
-/// Identity info extracted from Claude credentials
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaudeIdentity {
-    pub email: Option<String>,
-    pub account_id: Option<String>,
-    pub plan: Option<String>,
-}
-
 /// Read Claude credentials from ~/.claude/.credentials.json
 pub fn read_claude_credentials_file() -> Result<Option<ClaudeCredentialsFile>> {
     let path = common::claude_credentials_path()?;
@@ -51,8 +43,6 @@ pub fn read_claude_credentials_file() -> Result<Option<ClaudeCredentialsFile>> {
 /// Read Claude credentials from macOS Keychain
 #[cfg(target_os = "macos")]
 pub fn read_claude_keychain() -> Result<Option<ClaudeCredentialsFile>> {
-    // Try to read from keychain using the `security` CLI tool
-    // security-framework crate requires exact account name which varies per user
     let output = std::process::Command::new("security")
         .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
         .output();
@@ -77,13 +67,11 @@ pub fn read_claude_keychain() -> Result<Option<ClaudeCredentialsFile>> {
 
 /// Get Claude credentials from file first, then keychain
 pub fn read_claude_credentials() -> Result<Option<ClaudeCredentialsFile>> {
-    // Try file first
     if let Some(creds) = read_claude_credentials_file()? {
         if creds.claude_ai_oauth.is_some() {
             return Ok(Some(creds));
         }
     }
-    // Fall back to keychain
     read_claude_keychain()
 }
 
@@ -92,23 +80,30 @@ pub fn claude_access_token(creds: &ClaudeCredentialsFile) -> Option<String> {
     creds.claude_ai_oauth.as_ref()?.access_token.clone()
 }
 
-/// Try to extract identity from Claude (we don't have a JWT to decode for Claude,
-/// so we'll use the API to get account info, or store what the user tells us)
-pub fn extract_claude_identity(_creds: &ClaudeCredentialsFile) -> ClaudeIdentity {
-    // Claude OAuth tokens don't contain email in the JWT like Codex does.
-    // We'll fetch this from the API when saving.
-    ClaudeIdentity {
-        email: None,
-        account_id: None,
-        plan: None,
-    }
+/// Check if a Claude token is expired or will expire within 5 minutes
+pub fn is_claude_token_expired(creds: &ClaudeCredentialsFile) -> bool {
+    let Some(oauth) = &creds.claude_ai_oauth else {
+        return true;
+    };
+    let Some(expires_at_ms) = oauth.expires_at else {
+        return true; // no expiry = assume expired
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+    let buffer_ms = 5.0 * 60.0 * 1000.0; // 5 minutes
+    now_ms + buffer_ms >= expires_at_ms
 }
 
 /// Save Claude credentials to file
 pub fn write_claude_credentials(creds: &ClaudeCredentialsFile) -> Result<()> {
     let path = common::claude_credentials_path()?;
     let data = serde_json::to_string_pretty(creds)?;
-    common::atomic_write(&path, data.as_bytes())
+    // Lock ~/.claude/ during writes to avoid races with Claude Code
+    let lock_path = common::claude_lock_path()?;
+    let mut lock = fslock::LockFile::open(&lock_path)?;
+    lock.lock().context("Failed to acquire Claude credential lock")?;
+    let result = common::atomic_write(&path, data.as_bytes());
+    lock.unlock().ok();
+    result
 }
 
 // ─── Codex Auth ───
@@ -169,7 +164,6 @@ pub fn extract_codex_identity(auth: &CodexAuthFile) -> Result<CodexIdentity> {
         .as_ref()
         .context("No id_token in Codex auth")?;
 
-    // Decode JWT payload (second segment)
     let parts: Vec<&str> = id_token.split('.').collect();
     if parts.len() < 2 {
         anyhow::bail!("Invalid JWT format");
@@ -203,7 +197,6 @@ pub fn extract_codex_identity(auth: &CodexAuthFile) -> Result<CodexIdentity> {
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Try to get principal/workspace IDs from claims
     let principal_id = claims
         .get("sub")
         .and_then(|v| v.as_str())
@@ -239,7 +232,6 @@ const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CLAUDE_REFRESH_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-/// Refresh a Codex OAuth token
 pub fn refresh_codex_token(refresh_token: &str) -> Result<CodexTokenRefreshResponse> {
     let resp = ureq::post(CODEX_REFRESH_URL)
         .set("Content-Type", "application/x-www-form-urlencoded")
@@ -249,8 +241,7 @@ pub fn refresh_codex_token(refresh_token: &str) -> Result<CodexTokenRefreshRespo
         ))
         .context("Failed to refresh Codex token")?;
 
-    let body: CodexTokenRefreshResponse = resp.into_json().context("Failed to parse refresh response")?;
-    Ok(body)
+    resp.into_json().context("Failed to parse refresh response")
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,7 +251,6 @@ pub struct CodexTokenRefreshResponse {
     pub refresh_token: Option<String>,
 }
 
-/// Refresh a Claude OAuth token
 pub fn refresh_claude_token(refresh_token: &str) -> Result<ClaudeTokenRefreshResponse> {
     let resp = ureq::post(CLAUDE_REFRESH_URL)
         .set("Content-Type", "application/x-www-form-urlencoded")
@@ -270,8 +260,7 @@ pub fn refresh_claude_token(refresh_token: &str) -> Result<ClaudeTokenRefreshRes
         ))
         .context("Failed to refresh Claude token")?;
 
-    let body: ClaudeTokenRefreshResponse = resp.into_json().context("Failed to parse refresh response")?;
-    Ok(body)
+    resp.into_json().context("Failed to parse refresh response")
 }
 
 #[derive(Debug, Deserialize)]
@@ -291,17 +280,15 @@ fn title_case(s: &str) -> String {
     }
 }
 
-/// Get the raw bytes of a Claude credentials for storage
 pub fn serialize_claude_credentials(creds: &ClaudeCredentialsFile) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec_pretty(creds)?)
 }
 
-/// Get the raw bytes of a Codex auth for storage
 pub fn serialize_codex_auth(auth: &CodexAuthFile) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec_pretty(auth)?)
 }
 
-/// Fetch Claude account info using the access token
+/// Fetch Claude account info using the access token (rich metadata)
 pub fn fetch_claude_account_info(access_token: &str) -> Result<ClaudeAccountInfo> {
     let resp = ureq::get("https://api.anthropic.com/api/oauth/account")
         .set("Authorization", &format!("Bearer {}", access_token))
@@ -315,10 +302,34 @@ pub fn fetch_claude_account_info(access_token: &str) -> Result<ClaudeAccountInfo
     Ok(body)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeAccountInfo {
     pub email_address: Option<String>,
     pub uuid: Option<String>,
     pub full_name: Option<String>,
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub memberships: Option<Vec<ClaudeMembership>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeMembership {
+    pub organization: Option<ClaudeOrganization>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeOrganization {
+    pub uuid: Option<String>,
+    pub name: Option<String>,
+}
+
+/// Get the default scopes for Claude Code OAuth
+pub fn claude_default_scopes() -> Vec<String> {
+    vec![
+        "user:profile".into(),
+        "user:inference".into(),
+        "user:sessions:claude_code".into(),
+        "user:mcp_servers".into(),
+        "user:file_upload".into(),
+    ]
 }

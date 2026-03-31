@@ -56,6 +56,8 @@ pub enum Commands {
         #[command(subcommand)]
         command: LabelCommands,
     },
+    /// Show Claude Code usage stats (sessions, tokens, daily activity)
+    Costs,
     /// Run diagnostics and check configuration
     Doctor,
 }

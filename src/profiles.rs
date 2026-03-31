@@ -29,6 +29,15 @@ pub struct ProfileMeta {
     pub principal_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_or_org_id: Option<String>,
+    // Rich metadata from Claude account API
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_tier: Option<String>,
 }
 
 impl ProfileIndex {
@@ -110,30 +119,40 @@ fn save_claude() -> Result<()> {
         .unwrap_or("pro")
         .to_string();
 
-    // Try to fetch account info for email
+    // Try to fetch account info for email + rich metadata
     print!("{}", "Fetching Claude account info... ".dimmed());
-    let (email, account_id) = match auth::fetch_claude_account_info(access_token) {
-        Ok(info) => {
-            println!("{}", "OK".green());
-            (
-                info.email_address.unwrap_or_else(|| "unknown".into()),
-                info.uuid,
-            )
-        }
-        Err(e) => {
-            println!("{}", "failed".yellow());
-            ui::print_warning(&format!(
-                "Could not fetch account info: {}. Enter manually.",
-                e
-            ));
+    let (email, account_id, display_name, org_name, org_uuid) =
+        match auth::fetch_claude_account_info(access_token) {
+            Ok(info) => {
+                println!("{}", "OK".green());
+                let org = info
+                    .memberships
+                    .as_ref()
+                    .and_then(|m| m.first())
+                    .and_then(|m| m.organization.as_ref());
+                (
+                    info.email_address.unwrap_or_else(|| "unknown".into()),
+                    info.uuid,
+                    info.display_name,
+                    org.and_then(|o| o.name.clone()),
+                    org.and_then(|o| o.uuid.clone()),
+                )
+            }
+            Err(e) => {
+                println!("{}", "failed".yellow());
+                ui::print_warning(&format!(
+                    "Could not fetch account info: {}. Enter manually.",
+                    e
+                ));
 
-            let email = inquire::Text::new("Email for this profile:")
-                .prompt()
-                .context("Prompt cancelled")?;
-            (email, None)
-        }
-    };
+                let email = inquire::Text::new("Email for this profile:")
+                    .prompt()
+                    .context("Prompt cancelled")?;
+                (email, None, None, None, None)
+            }
+        };
 
+    let rate_limit_tier = oauth.rate_limit_tier.clone();
     let profile_id = claude_profile_id(&email, &plan);
 
     // Ask for optional label
@@ -146,7 +165,6 @@ fn save_claude() -> Result<()> {
     with_lock("claude", || {
         let mut index = load_index("claude")?;
 
-        // Check if profile already exists
         if index.profiles.contains_key(&profile_id) {
             let overwrite = inquire::Confirm::new(&format!(
                 "Profile '{}' already exists. Overwrite?",
@@ -162,12 +180,10 @@ fn save_claude() -> Result<()> {
             }
         }
 
-        // Save the credentials file
         let profile_path = common::profiles_dir("claude")?.join(&profile_id);
         let data = auth::serialize_claude_credentials(&creds)?;
         common::atomic_write(&profile_path, &data)?;
 
-        // Update index
         index.profiles.insert(
             profile_id.clone(),
             ProfileMeta {
@@ -177,14 +193,21 @@ fn save_claude() -> Result<()> {
                 label,
                 account_id,
                 principal_id: None,
-                workspace_or_org_id: None,
+                workspace_or_org_id: org_uuid.clone(),
+                display_name,
+                org_name: org_name.clone(),
+                org_uuid,
+                rate_limit_tier,
             },
         );
         save_index("claude", &index)?;
 
+        let org_display = org_name
+            .map(|o| format!(" ({})", o))
+            .unwrap_or_default();
         ui::print_success(&format!(
-            "✅ Saved Claude profile: {} ({})",
-            profile_id, email
+            "✅ Saved Claude profile: {} ({}){}",
+            profile_id, email, org_display
         ));
         Ok(())
     })
@@ -239,6 +262,10 @@ fn save_codex() -> Result<()> {
                 account_id: Some(identity.account_id),
                 principal_id: identity.principal_id,
                 workspace_or_org_id: identity.workspace_or_org_id,
+                display_name: None,
+                org_name: None,
+                org_uuid: None,
+                rate_limit_tier: None,
             },
         );
         save_index("codex", &index)?;
@@ -300,8 +327,34 @@ pub fn load(tool: &str) -> Result<()> {
         match tool {
             "claude" => {
                 let creds: auth::ClaudeCredentialsFile = serde_json::from_slice(&data)?;
+
+                // Write credentials file (with file locking)
                 auth::write_claude_credentials(&creds)?;
                 ui::print_success(&format!("✅ Loaded Claude profile: {}", profile_id));
+
+                // Also print env var for fast session switching
+                if let Some(ref oauth) = creds.claude_ai_oauth {
+                    if let Some(ref rt) = oauth.refresh_token {
+                        let scopes = oauth
+                            .scopes
+                            .as_ref()
+                            .map(|s| s.join(","))
+                            .unwrap_or_else(|| auth::claude_default_scopes().join(","));
+                        println!();
+                        println!(
+                            "{}",
+                            "For instant switching in new shells, run:".dimmed()
+                        );
+                        println!(
+                            "  export CLAUDE_CODE_OAUTH_REFRESH_TOKEN={}",
+                            rt
+                        );
+                        println!(
+                            "  export CLAUDE_CODE_OAUTH_SCOPES={}",
+                            scopes
+                        );
+                    }
+                }
             }
             "codex" => {
                 let auth_data: auth::CodexAuthFile = serde_json::from_slice(&data)?;

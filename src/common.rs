@@ -50,6 +50,18 @@ pub fn claude_credentials_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".claude").join(".credentials.json"))
 }
 
+/// ~/.claude/.aps.lock — lock file for credential writes (avoids races with Claude Code)
+pub fn claude_lock_path() -> Result<PathBuf> {
+    let dir = home_dir()?.join(".claude");
+    fs::create_dir_all(&dir)?;
+    Ok(dir.join(".aps.lock"))
+}
+
+/// ~/.claude/stats-cache.json — Claude Code's session statistics
+pub fn claude_stats_cache_path() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".claude").join("stats-cache.json"))
+}
+
 /// ~/.codex/auth.json
 pub fn codex_auth_path() -> Result<PathBuf> {
     let codex_home = std::env::var("CODEX_HOME")

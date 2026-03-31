@@ -1,5 +1,6 @@
 mod cli;
 mod common;
+mod costs;
 mod profiles;
 mod auth;
 mod ui;
@@ -28,6 +29,7 @@ fn main() {
             LabelCommands::Clear { tool, id } => profiles::label_clear(&tool, &id),
             LabelCommands::Rename { tool, from, to } => profiles::label_rename(&tool, &from, &to),
         },
+        Commands::Costs => costs::costs(),
         Commands::Doctor => profiles::doctor(),
     };
 
