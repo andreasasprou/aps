@@ -717,11 +717,11 @@ pub fn oauth_codex(label: Option<&str>) -> Result<()> {
         .or_else(|_| tiny_http::Server::http("localhost:0"))
         .map_err(|e| anyhow::anyhow!("Failed to start callback server: {}", e))?;
     let port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(1455);
-    let redirect_uri = format!("http://localhost:{}/callback", port);
+    let redirect_uri = format!("http://localhost:{}/auth/callback", port);
 
-    // Build authorization URL
+    // Build authorization URL (matching Codex CLI's exact parameters)
     let auth_url = format!(
-        "{}/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&id_token_add_organizations=true&codex_cli_simplified_flow=true",
+        "{}/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=codex_cli_rs",
         CODEX_ISSUER,
         urlencod(CODEX_CLIENT_ID),
         urlencod(&redirect_uri),
