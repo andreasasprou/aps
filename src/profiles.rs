@@ -1070,3 +1070,73 @@ pub fn save_claude_oauth_profile(
         Ok(())
     })
 }
+
+pub fn save_codex_oauth_profile(
+    auth_data: auth::CodexAuthFile,
+    identity: &auth::CodexIdentity,
+    label: Option<&str>,
+) -> Result<()> {
+    let profile_id = codex_profile_id(&identity.email, &identity.plan_type_key);
+
+    let label = if let Some(l) = label {
+        Some(l.to_string())
+    } else {
+        let default_label = identity.email.split('@').next().unwrap_or("").to_string();
+        inquire::Text::new("Label (optional):")
+            .with_default(&default_label)
+            .prompt()
+            .ok()
+            .filter(|s| !s.is_empty())
+    };
+
+    with_lock("codex", || {
+        let mut index = load_index("codex")?;
+
+        if index.profiles.contains_key(&profile_id) {
+            let overwrite = inquire::Confirm::new(&format!(
+                "Profile '{}' already exists. Overwrite?",
+                profile_id
+            ))
+            .with_default(true)
+            .prompt()
+            .unwrap_or(false);
+
+            if !overwrite {
+                println!("{}", "Save cancelled.".dimmed());
+                return Ok(());
+            }
+        }
+
+        let profile_path = common::profiles_dir("codex")?.join(&profile_id);
+        let data = auth::serialize_codex_auth(&auth_data)?;
+        common::atomic_write(&profile_path, &data)?;
+
+        index.profiles.insert(
+            profile_id.clone(),
+            ProfileMeta {
+                email: identity.email.clone(),
+                plan: identity.plan.clone(),
+                plan_type_key: identity.plan_type_key.clone(),
+                label,
+                account_id: Some(identity.account_id.clone()),
+                principal_id: identity.principal_id.clone(),
+                workspace_or_org_id: identity.workspace_or_org_id.clone(),
+                display_name: None,
+                org_name: None,
+                org_uuid: None,
+                rate_limit_tier: None,
+            },
+        );
+        save_index("codex", &index)?;
+        let _ = write_stored_active_profile("codex", &profile_id);
+
+        // Also write as active credentials
+        auth::write_codex_auth(&auth_data)?;
+
+        ui::print_success(&format!(
+            "Saved Codex profile (OAuth): {} ({})",
+            profile_id, identity.email
+        ));
+        Ok(())
+    })
+}

@@ -88,6 +88,12 @@ pub enum AuthCommands {
         #[arg(long, short)]
         label: Option<String>,
     },
+    /// Authenticate with Codex via OAuth PKCE (opens browser)
+    Codex {
+        /// Optional label for the saved profile
+        #[arg(long, short)]
+        label: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

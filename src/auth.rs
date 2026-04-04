@@ -695,3 +695,112 @@ fn urlencod(s: &str) -> String {
     }
     out
 }
+
+// ─── Codex OAuth PKCE Flow ───
+
+const CODEX_ISSUER: &str = "https://auth.openai.com";
+const CODEX_OAUTH_SCOPES: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
+
+/// Full OAuth PKCE flow for Codex: opens browser, gets tokens, saves profile
+pub fn oauth_codex(label: Option<&str>) -> Result<()> {
+    use colored::Colorize;
+
+    println!("{}", "Starting Codex OAuth authentication...".bold());
+    println!();
+
+    let code_verifier = generate_code_verifier();
+    let code_challenge = generate_code_challenge(&code_verifier);
+    let state = uuid::Uuid::new_v4().to_string();
+
+    // Start local callback server (Codex uses port 1455 by default)
+    let server = tiny_http::Server::http("localhost:1455")
+        .or_else(|_| tiny_http::Server::http("localhost:0"))
+        .map_err(|e| anyhow::anyhow!("Failed to start callback server: {}", e))?;
+    let port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(1455);
+    let redirect_uri = format!("http://localhost:{}/callback", port);
+
+    // Build authorization URL
+    let auth_url = format!(
+        "{}/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&id_token_add_organizations=true&codex_cli_simplified_flow=true",
+        CODEX_ISSUER,
+        urlencod(CODEX_CLIENT_ID),
+        urlencod(&redirect_uri),
+        urlencod(CODEX_OAUTH_SCOPES),
+        urlencod(&code_challenge),
+        urlencod(&state),
+    );
+
+    println!("Opening browser for authentication...");
+    println!();
+    if open::that(&auth_url).is_err() {
+        println!("{}", "Could not open browser automatically. Open this URL:".yellow());
+        println!("  {}", auth_url);
+    }
+    println!("{}", "Waiting for OAuth callback (up to 5 minutes)...".dimmed());
+
+    // Wait for callback
+    let (code, returned_state) = wait_for_callback(server)?;
+
+    if returned_state != state {
+        anyhow::bail!("OAuth state mismatch — possible CSRF attack");
+    }
+
+    println!();
+    print!("{}", "Exchanging code for tokens... ".dimmed());
+
+    // Codex uses form-urlencoded for token exchange (not JSON)
+    let token_body = format!(
+        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
+        urlencod(&code),
+        urlencod(&redirect_uri),
+        urlencod(CODEX_CLIENT_ID),
+        urlencod(&code_verifier),
+    );
+
+    let token_resp = match ureq::post(&format!("{}/oauth/token", CODEX_ISSUER))
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .send_string(&token_body)
+    {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            anyhow::bail!("Token exchange failed (HTTP {}): {}", code, body);
+        }
+        Err(e) => return Err(e).context("Failed to exchange authorization code"),
+    };
+
+    #[derive(Debug, Deserialize)]
+    struct CodexOAuthTokenResponse {
+        id_token: String,
+        access_token: String,
+        refresh_token: String,
+    }
+
+    let tokens: CodexOAuthTokenResponse = token_resp.into_json()
+        .context("Failed to parse Codex token response")?;
+    println!("{}", "OK".green());
+
+    // Extract identity from id_token JWT
+    let auth_data = CodexAuthFile {
+        auth_mode: Some("chatgpt".into()),
+        openai_api_key: None,
+        tokens: Some(CodexTokens {
+            id_token: Some(tokens.id_token),
+            access_token: Some(tokens.access_token),
+            refresh_token: Some(tokens.refresh_token),
+            account_id: None, // will be extracted from JWT below
+        }),
+        last_refresh: Some(chrono::Utc::now().to_rfc3339()),
+    };
+
+    let identity = extract_codex_identity(&auth_data)?;
+
+    println!("{}", format!("  Account: {} ({})", identity.email, identity.plan).dimmed());
+
+    // Save as profile
+    profiles::save_codex_oauth_profile(
+        auth_data,
+        &identity,
+        label,
+    )
+}
