@@ -3,17 +3,18 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use colored::Colorize;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
 use std::thread;
 
 use crate::auth;
+use crate::common;
 use crate::profiles;
 use crate::ui;
 
 // ─── Claude Usage API ───
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ClaudeUsageResponse {
     pub five_hour: Option<UsageWindow>,
     pub seven_day: Option<UsageWindow>,
@@ -23,13 +24,13 @@ pub struct ClaudeUsageResponse {
     pub extra_usage: Option<ExtraUsage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct UsageWindow {
     pub utilization: Option<f64>,
     pub resets_at: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ExtraUsage {
     pub is_enabled: Option<bool>,
     pub monthly_limit: Option<f64>,
@@ -57,7 +58,7 @@ fn fetch_claude_usage_once(access_token: &str) -> Result<ClaudeUsageResponse> {
             }
             Err(ureq::Error::Status(429, _)) => {
                 if attempt == delays.len() - 1 {
-                    anyhow::bail!("Rate limited — switch to this account with `aps load claude` to view usage")
+                    anyhow::bail!("rate_limited")
                 }
                 // retry
             }
@@ -72,7 +73,7 @@ fn fetch_claude_usage_once(access_token: &str) -> Result<ClaudeUsageResponse> {
 
 // ─── Codex Usage API ───
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CodexUsageResponse {
     #[serde(default)]
     pub plan_type: Option<String>,
@@ -82,20 +83,20 @@ pub struct CodexUsageResponse {
     pub credits: Option<CodexCredits>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CodexRateLimit {
     pub primary_window: Option<CodexWindow>,
     pub secondary_window: Option<CodexWindow>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CodexWindow {
     pub used_percent: Option<f64>,
     pub reset_at: Option<f64>, // unix timestamp seconds
     pub limit_window_seconds: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CodexCredits {
     pub has_credits: Option<bool>,
     pub unlimited: Option<bool>,
@@ -116,6 +117,9 @@ fn fetch_codex_usage_once(access_token: &str, account_id: Option<&str>) -> Resul
         Ok(resp) => resp.into_json().context("Failed to parse Codex usage response"),
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
             anyhow::bail!("token_expired")
+        }
+        Err(ureq::Error::Status(429, _)) => {
+            anyhow::bail!("rate_limited")
         }
         Err(e) => Err(e).context("Failed to fetch Codex usage"),
     }
@@ -161,7 +165,7 @@ fn fetch_codex_usage_with_refresh(
 
 /// What kind of usage to fetch
 enum FetchJob {
-    Claude { access_token: String, refresh_token: Option<String>, profile_id: Option<String> },
+    Claude { access_token: String, refresh_token: Option<String>, profile_id: Option<String>, is_active: bool },
     Codex { access_token: String, account_id: Option<String>, refresh_token: Option<String>, profile_id: Option<String> },
     Inactive { message: String },
     /// Section divider (not a real fetch)
@@ -205,8 +209,8 @@ fn fetch_claude_usage_with_refresh(
 
 /// Result of a parallel fetch, keyed by index for ordered display
 enum FetchResult {
-    Claude(Result<ClaudeUsageResponse>),
-    Codex(Result<CodexUsageResponse>),
+    Claude(Result<ClaudeUsageResponse>, Option<String>),
+    Codex(Result<CodexUsageResponse>, Option<String>),
     Skipped(String),
     Section(String),
 }
@@ -218,6 +222,56 @@ struct ProfileDisplay {
     email: String,
     label: String,
     is_active: bool,
+}
+
+// ─── Usage Cache ───
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedUsage<T> {
+    cached_at: i64, // unix timestamp seconds
+    data: T,
+}
+
+fn write_usage_cache<T: Serialize>(tool: &str, profile_id: &str, data: &T) {
+    let path = match common::usage_cache_path(tool, profile_id) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let entry = CachedUsage {
+        cached_at: Utc::now().timestamp(),
+        data,
+    };
+    if let Ok(json) = serde_json::to_vec_pretty(&entry) {
+        let _ = common::atomic_write(&path, &json);
+    }
+}
+
+fn read_claude_cache(profile_id: &str) -> Option<(ClaudeUsageResponse, String)> {
+    let path = common::usage_cache_path("claude", profile_id).ok()?;
+    let data = std::fs::read_to_string(&path).ok()?;
+    let cached: CachedUsage<ClaudeUsageResponse> = serde_json::from_str(&data).ok()?;
+    let suffix = format_cache_age(cached.cached_at);
+    Some((cached.data, suffix))
+}
+
+fn read_codex_cache(profile_id: &str) -> Option<(CodexUsageResponse, String)> {
+    let path = common::usage_cache_path("codex", profile_id).ok()?;
+    let data = std::fs::read_to_string(&path).ok()?;
+    let cached: CachedUsage<CodexUsageResponse> = serde_json::from_str(&data).ok()?;
+    let suffix = format_cache_age(cached.cached_at);
+    Some((cached.data, suffix))
+}
+
+fn format_cache_age(cached_at: i64) -> String {
+    let now = Utc::now().timestamp();
+    let age_secs = now - cached_at;
+    if age_secs < 60 {
+        "(cached <1m ago)".to_string()
+    } else if age_secs < 3600 {
+        format!("(cached {}m ago)", age_secs / 60)
+    } else {
+        format!("(cached {}h ago)", age_secs / 3600)
+    }
 }
 
 // ─── Status Command ───
@@ -259,7 +313,7 @@ fn status_active_parallel(tools: &[&str]) -> Result<()> {
                         let active_pid = active.map(|(id, _, _)| id.clone());
                         jobs.push((
                             ProfileDisplay { tool: "claude".into(), plan, email, label, is_active: true },
-                            FetchJob::Claude { access_token: token, refresh_token, profile_id: active_pid },
+                            FetchJob::Claude { access_token: token, refresh_token, profile_id: active_pid, is_active: true },
                         ));
                     } else {
                         println!("  claude: {}", "No active auth".dimmed());
@@ -353,7 +407,7 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                             let refresh_token = fresh_creds.claude_ai_oauth.as_ref()
                                 .and_then(|o| o.refresh_token.clone());
                             if let Some(token) = auth::claude_access_token(&fresh_creds) {
-                                jobs.push((display, FetchJob::Claude { access_token: token, refresh_token, profile_id: Some(id.clone()) }));
+                                jobs.push((display, FetchJob::Claude { access_token: token, refresh_token, profile_id: Some(id.clone()), is_active: true }));
                                 continue;
                             }
                         }
@@ -365,7 +419,7 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                     let refresh_token = creds.claude_ai_oauth.as_ref()
                         .and_then(|o| o.refresh_token.clone());
                     if let Some(token) = auth::claude_access_token(&creds) {
-                        jobs.push((display, FetchJob::Claude { access_token: token, refresh_token, profile_id: Some(id.clone()) }));
+                        jobs.push((display, FetchJob::Claude { access_token: token, refresh_token, profile_id: Some(id.clone()), is_active: *is_active }));
                     } else {
                         jobs.push((display, FetchJob::Inactive {
                             message: "No access token. Run `aps save claude` after switching to this account.".into(),
@@ -405,7 +459,16 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
     fetch_and_display(jobs)
 }
 
-/// Fire all fetches in parallel, display results in order as they arrive
+/// Collected info for a Claude job to process sequentially
+struct ClaudeJobInfo {
+    idx: usize,
+    access_token: String,
+    refresh_token: Option<String>,
+    profile_id: Option<String>,
+    is_active: bool,
+}
+
+/// Fire fetches: Claude jobs serialized in one thread, Codex jobs parallel
 fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
     if jobs.is_empty() {
         return Ok(());
@@ -414,32 +477,28 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
     let count = jobs.len();
     let (tx, rx) = mpsc::channel::<(usize, FetchResult)>();
 
-    // Spawn all fetches — stagger Claude calls to avoid 429 rate limits
-    let mut claude_idx = 0u64;
+    // Collect Claude jobs for sequential processing; dispatch others immediately
+    let mut claude_jobs: Vec<ClaudeJobInfo> = Vec::new();
+
     for (idx, (_display, job)) in jobs.iter().enumerate() {
         let tx = tx.clone();
         match job {
-            FetchJob::Claude { access_token, refresh_token, profile_id } => {
+            FetchJob::Claude { access_token, refresh_token, profile_id, is_active } => {
                 if access_token.is_empty() {
-                    let _ = tx.send((idx, FetchResult::Claude(Err(anyhow::anyhow!("No access token")))));
+                    let _ = tx.send((idx, FetchResult::Claude(Err(anyhow::anyhow!("No access token")), None)));
                     continue;
                 }
-                let token = access_token.clone();
-                let rt = refresh_token.clone();
-                let pid = profile_id.clone();
-                let delay_ms = claude_idx * 2000; // stagger 2s between Claude calls to avoid 429
-                claude_idx += 1;
-                thread::spawn(move || {
-                    if delay_ms > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    }
-                    let result = fetch_claude_usage_with_refresh(&token, rt.as_deref(), pid.as_deref());
-                    let _ = tx.send((idx, FetchResult::Claude(result)));
+                claude_jobs.push(ClaudeJobInfo {
+                    idx,
+                    access_token: access_token.clone(),
+                    refresh_token: refresh_token.clone(),
+                    profile_id: profile_id.clone(),
+                    is_active: *is_active,
                 });
             }
             FetchJob::Codex { access_token, account_id, refresh_token, profile_id } => {
                 if access_token.is_empty() {
-                    let _ = tx.send((idx, FetchResult::Codex(Err(anyhow::anyhow!("No access token")))));
+                    let _ = tx.send((idx, FetchResult::Codex(Err(anyhow::anyhow!("No access token")), None)));
                     continue;
                 }
                 let token = access_token.clone();
@@ -448,7 +507,31 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                 let pid = profile_id.clone();
                 thread::spawn(move || {
                     let result = fetch_codex_usage_with_refresh(&token, aid.as_deref(), rt.as_deref(), pid.as_deref());
-                    let _ = tx.send((idx, FetchResult::Codex(result)));
+                    let (fetch_result, cache_suffix) = match result {
+                        Ok(usage) => {
+                            // Cache on success
+                            if let Some(ref p) = pid {
+                                write_usage_cache("codex", p, &usage);
+                            }
+                            (Ok(usage), None)
+                        }
+                        Err(e) => {
+                            let err_str = format!("{}", e);
+                            if err_str.contains("rate_limited") {
+                                // Try cache fallback
+                                if let Some(ref p) = pid {
+                                    if let Some((cached, suffix)) = read_codex_cache(p) {
+                                        let _ = tx.send((idx, FetchResult::Codex(Ok(cached), Some(suffix))));
+                                        return;
+                                    }
+                                }
+                                (Err(anyhow::anyhow!("Rate limited")), None)
+                            } else {
+                                (Err(e), None)
+                            }
+                        }
+                    };
+                    let _ = tx.send((idx, FetchResult::Codex(fetch_result, cache_suffix)));
                 });
             }
             FetchJob::Inactive { message } => {
@@ -461,6 +544,56 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
             }
         }
     }
+
+    // Sort Claude jobs: active first, then non-active
+    claude_jobs.sort_by(|a, b| b.is_active.cmp(&a.is_active));
+
+    // Spawn a single thread that processes all Claude jobs sequentially
+    if !claude_jobs.is_empty() {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for (i, job) in claude_jobs.iter().enumerate() {
+                // Active profile goes first with no delay; non-active get 3s gap
+                if i > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+                let result = fetch_claude_usage_with_refresh(
+                    &job.access_token,
+                    job.refresh_token.as_deref(),
+                    job.profile_id.as_deref(),
+                );
+                let (fetch_result, cache_suffix) = match result {
+                    Ok(usage) => {
+                        // Cache on success
+                        if let Some(ref p) = job.profile_id {
+                            write_usage_cache("claude", p, &usage);
+                        }
+                        (Ok(usage), None)
+                    }
+                    Err(e) => {
+                        let err_str = format!("{}", e);
+                        if err_str.contains("rate_limited") {
+                            // Try cache fallback
+                            if let Some(ref p) = job.profile_id {
+                                if let Some((cached, suffix)) = read_claude_cache(p) {
+                                    let _ = tx.send((job.idx, FetchResult::Claude(Ok(cached), Some(suffix))));
+                                    continue;
+                                }
+                            }
+                            (Err(anyhow::anyhow!("Rate limited — switch to this account with `aps load claude` to view usage")), None)
+                        } else if err_str.contains("token_expired") {
+                            // Don't use cache for genuinely broken tokens
+                            (Err(e), None)
+                        } else {
+                            (Err(e), None)
+                        }
+                    }
+                };
+                let _ = tx.send((job.idx, FetchResult::Claude(fetch_result, cache_suffix)));
+            }
+        });
+    }
+
     drop(tx); // Close sender so rx iterator ends
 
     // Collect results, display in original order
@@ -502,12 +635,22 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
             );
 
             match result {
-                FetchResult::Claude(Ok(usage)) => print_claude_usage(&usage, 4),
-                FetchResult::Claude(Err(e)) => {
+                FetchResult::Claude(Ok(usage), cache_suffix) => {
+                    if let Some(ref suffix) = cache_suffix {
+                        println!("    {}", suffix.dimmed());
+                    }
+                    print_claude_usage(&usage, 4);
+                }
+                FetchResult::Claude(Err(e), _) => {
                     println!("    {}", format!("Failed to fetch usage: {}", e).red());
                 }
-                FetchResult::Codex(Ok(usage)) => print_codex_usage(&usage, 4),
-                FetchResult::Codex(Err(e)) => {
+                FetchResult::Codex(Ok(usage), cache_suffix) => {
+                    if let Some(ref suffix) = cache_suffix {
+                        println!("    {}", suffix.dimmed());
+                    }
+                    print_codex_usage(&usage, 4);
+                }
+                FetchResult::Codex(Err(e), _) => {
                     println!("    {}", format!("Failed to fetch usage: {}", e).red());
                 }
                 FetchResult::Skipped(msg) => {

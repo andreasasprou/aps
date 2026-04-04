@@ -7,7 +7,7 @@ mod ui;
 mod usage;
 
 use clap::Parser;
-use cli::{Cli, Commands, LabelCommands};
+use cli::{Cli, Commands, LabelCommands, AuthCommands};
 
 fn main() {
     let cli = Cli::parse();
@@ -33,6 +33,9 @@ fn main() {
         },
         Commands::Costs => costs::costs(),
         Commands::Doctor => profiles::doctor(),
+        Commands::Auth { command } => match command {
+            AuthCommands::Claude { label } => auth::oauth_claude(label.as_deref()),
+        },
     };
 
     if let Err(e) = result {

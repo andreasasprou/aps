@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 
 use crate::common;
+use crate::profiles;
 
 // ─── Claude Code Auth ───
 
@@ -439,4 +440,231 @@ pub fn claude_default_scopes() -> Vec<String> {
         "user:mcp_servers".into(),
         "user:file_upload".into(),
     ]
+}
+
+// ─── OAuth PKCE Flow ───
+
+fn generate_code_verifier() -> String {
+    use rand::RngCore;
+    let mut buf = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut buf);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+fn generate_code_challenge(verifier: &str) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
+}
+
+fn start_callback_server() -> Result<tiny_http::Server> {
+    // Try preferred port first, fall back to OS-assigned
+    if let Ok(server) = tiny_http::Server::http("127.0.0.1:9876") {
+        return Ok(server);
+    }
+    tiny_http::Server::http("127.0.0.1:0")
+        .map_err(|e| anyhow::anyhow!("Failed to start callback server: {}", e))
+}
+
+fn wait_for_callback(server: tiny_http::Server) -> Result<(String, String)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        // Accept one request
+        if let Ok(request) = server.recv() {
+            let url = request.url().to_string();
+            // Send a nice HTML response back to the browser
+            let response_body = "<html><body><h2>Authentication successful!</h2><p>You can close this tab and return to your terminal.</p></body></html>";
+            let response = tiny_http::Response::from_string(response_body)
+                .with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap(),
+                );
+            let _ = request.respond(response);
+            let _ = tx.send(url);
+        }
+    });
+
+    let url = rx.recv_timeout(std::time::Duration::from_secs(300))
+        .context("Timed out waiting for OAuth callback (5 minutes)")?;
+
+    // Parse query params from /callback?code=...&state=...
+    let query = url.split('?').nth(1).unwrap_or("");
+    let mut code = None;
+    let mut state = None;
+    for pair in query.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        let key = kv.next().unwrap_or("");
+        let val = kv.next().unwrap_or("");
+        match key {
+            "code" => code = Some(val.to_string()),
+            "state" => state = Some(val.to_string()),
+            _ => {}
+        }
+    }
+
+    let code = code.context("No 'code' parameter in OAuth callback")?;
+    let state = state.unwrap_or_default();
+    Ok((code, state))
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: Option<u64>,
+}
+
+fn exchange_code_for_tokens(
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+) -> Result<OAuthTokenResponse> {
+    let body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "client_id": CLAUDE_CLIENT_ID,
+        "code": code,
+        "code_verifier": code_verifier,
+        "redirect_uri": redirect_uri,
+    });
+
+    let resp = ureq::post(CLAUDE_REFRESH_URL)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .context("Failed to exchange authorization code for tokens")?;
+
+    resp.into_json().context("Failed to parse token response")
+}
+
+/// Full OAuth PKCE flow for Claude: opens browser, gets tokens, saves profile
+pub fn oauth_claude(label: Option<&str>) -> Result<()> {
+    use colored::Colorize;
+
+    println!("{}", "Starting Claude OAuth authentication...".bold());
+    println!();
+
+    let code_verifier = generate_code_verifier();
+    let code_challenge = generate_code_challenge(&code_verifier);
+    let state = uuid::Uuid::new_v4().to_string();
+
+    // Start local callback server
+    let server = start_callback_server()?;
+    let port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(9876);
+    let redirect_uri = format!("http://127.0.0.1:{}/callback", port);
+
+    let scope = claude_default_scopes().join(" ");
+
+    // Build authorization URL
+    let auth_url = format!(
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        "https://claude.com/cai/oauth/authorize",
+        CLAUDE_CLIENT_ID,
+        urlencod(&redirect_uri),
+        urlencod(&scope),
+        urlencod(&state),
+        urlencod(&code_challenge),
+    );
+
+    println!("Opening browser for authentication...");
+    println!();
+    if open::that(&auth_url).is_err() {
+        println!("{}", "Could not open browser automatically. Open this URL:".yellow());
+        println!("  {}", auth_url);
+    }
+    println!("{}", "Waiting for OAuth callback (up to 5 minutes)...".dimmed());
+
+    // Wait for the callback
+    let (code, returned_state) = wait_for_callback(server)?;
+
+    // Verify state
+    if returned_state != state {
+        anyhow::bail!("OAuth state mismatch — possible CSRF attack");
+    }
+
+    println!();
+    print!("{}", "Exchanging code for tokens... ".dimmed());
+
+    let tokens = exchange_code_for_tokens(&code, &code_verifier, &redirect_uri)?;
+    println!("{}", "OK".green());
+
+    // Fetch account info to get email + metadata
+    print!("{}", "Fetching account info... ".dimmed());
+    let (email, account_id, display_name, org_name, org_uuid, plan, rate_limit_tier) =
+        match fetch_claude_account_info(&tokens.access_token) {
+            Ok(info) => {
+                println!("{}", "OK".green());
+                let org = info
+                    .memberships
+                    .as_ref()
+                    .and_then(|m| m.first())
+                    .and_then(|m| m.organization.as_ref());
+                (
+                    info.email_address.unwrap_or_else(|| "unknown".into()),
+                    info.uuid,
+                    info.display_name,
+                    org.and_then(|o| o.name.clone()),
+                    org.and_then(|o| o.uuid.clone()),
+                    "max".to_string(),
+                    None::<String>,
+                )
+            }
+            Err(e) => {
+                println!("{}", "failed".yellow());
+                crate::ui::print_warning(&format!("Could not fetch account info: {}. Enter manually.", e));
+                let email_input = inquire::Text::new("Email for this profile:")
+                    .prompt()
+                    .context("Prompt cancelled")?;
+                (email_input, None, None, None, None, "max".to_string(), None)
+            }
+        };
+
+    let expires_at = tokens.expires_in.map(|secs| {
+        chrono::Utc::now().timestamp_millis() as f64 + (secs as f64 * 1000.0)
+    });
+
+    let refresh_token = tokens.refresh_token.unwrap_or_default();
+
+    let creds = ClaudeCredentialsFile {
+        claude_ai_oauth: Some(ClaudeOAuth {
+            access_token: Some(tokens.access_token),
+            refresh_token: Some(refresh_token),
+            expires_at,
+            scopes: Some(claude_default_scopes()),
+            rate_limit_tier: rate_limit_tier.clone(),
+            subscription_type: Some(plan.clone()),
+        }),
+    };
+
+    // Write credentials to the live location so Claude Code can use them immediately
+    write_claude_credentials(&creds)?;
+
+    // Save as a profile
+    profiles::save_claude_oauth_profile(
+        &creds,
+        &email,
+        &plan,
+        account_id,
+        display_name,
+        org_name,
+        org_uuid,
+        rate_limit_tier,
+        label,
+    )?;
+
+    Ok(())
+}
+
+/// Minimal percent-encoding for URL query parameter values
+fn urlencod(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    out
 }

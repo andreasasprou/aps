@@ -70,6 +70,13 @@ pub fn codex_auth_path() -> Result<PathBuf> {
     Ok(codex_home.join("auth.json"))
 }
 
+/// ~/.aps/claude/cache/<profile_id>.json or ~/.aps/codex/cache/<profile_id>.json
+pub fn usage_cache_path(tool: &str, profile_id: &str) -> Result<PathBuf> {
+    let dir = aps_dir()?.join(tool).join("cache");
+    fs::create_dir_all(&dir).context(format!("Failed to create cache dir for {}", tool))?;
+    Ok(dir.join(format!("{}.json", profile_id)))
+}
+
 /// ~/.aps/claude/active or ~/.aps/codex/active — tracks last loaded profile
 pub fn active_profile_path(tool: &str) -> Result<PathBuf> {
     let dir = aps_dir()?.join(tool);

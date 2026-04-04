@@ -996,3 +996,77 @@ pub fn read_profile_credentials(tool: &str, profile_id: &str) -> Result<Vec<u8>>
     let profile_path = common::profiles_dir(tool)?.join(profile_id);
     fs::read(&profile_path).context(format!("Failed to read profile: {}", profile_id))
 }
+
+/// Save a Claude profile from OAuth flow (called by auth::oauth_claude)
+pub fn save_claude_oauth_profile(
+    creds: &auth::ClaudeCredentialsFile,
+    email: &str,
+    plan: &str,
+    account_id: Option<String>,
+    display_name: Option<String>,
+    org_name: Option<String>,
+    org_uuid: Option<String>,
+    rate_limit_tier: Option<String>,
+    label: Option<&str>,
+) -> Result<()> {
+    let profile_id = claude_profile_id(email, plan);
+
+    let label = if let Some(l) = label {
+        Some(l.to_string())
+    } else {
+        inquire::Text::new("Label (optional):")
+            .with_default("")
+            .prompt()
+            .ok()
+            .filter(|s| !s.is_empty())
+    };
+
+    with_lock("claude", || {
+        let mut index = load_index("claude")?;
+
+        if index.profiles.contains_key(&profile_id) {
+            let overwrite = inquire::Confirm::new(&format!(
+                "Profile '{}' already exists. Overwrite?",
+                profile_id
+            ))
+            .with_default(true)
+            .prompt()
+            .unwrap_or(false);
+
+            if !overwrite {
+                println!("{}", "Save cancelled.".dimmed());
+                return Ok(());
+            }
+        }
+
+        let profile_path = common::profiles_dir("claude")?.join(&profile_id);
+        let data = auth::serialize_claude_credentials(creds)?;
+        common::atomic_write(&profile_path, &data)?;
+
+        index.profiles.insert(
+            profile_id.clone(),
+            ProfileMeta {
+                email: email.to_string(),
+                plan: plan.to_string(),
+                plan_type_key: plan.to_lowercase(),
+                label,
+                account_id,
+                principal_id: None,
+                workspace_or_org_id: org_uuid.clone(),
+                display_name,
+                org_name: org_name.clone(),
+                org_uuid,
+                rate_limit_tier,
+            },
+        );
+        save_index("claude", &index)?;
+        let _ = write_stored_active_profile("claude", &profile_id);
+
+        let org_display = org_name.map(|o| format!(" ({})", o)).unwrap_or_default();
+        ui::print_success(&format!(
+            "Saved Claude profile (OAuth): {} ({}){}",
+            profile_id, email, org_display
+        ));
+        Ok(())
+    })
+}

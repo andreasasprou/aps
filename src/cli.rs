@@ -73,6 +73,21 @@ pub enum Commands {
     Costs,
     /// Run diagnostics and check configuration
     Doctor,
+    /// Authenticate with a tool via OAuth
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AuthCommands {
+    /// Authenticate with Claude via OAuth PKCE (opens browser)
+    Claude {
+        /// Optional label for the saved profile
+        #[arg(long, short)]
+        label: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
