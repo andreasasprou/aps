@@ -233,12 +233,15 @@ const CLAUDE_REFRESH_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 pub fn refresh_codex_token(refresh_token: &str) -> Result<CodexTokenRefreshResponse> {
+    let body = serde_json::json!({
+        "client_id": CODEX_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token
+    });
+
     let resp = ureq::post(CODEX_REFRESH_URL)
-        .set("Content-Type", "application/x-www-form-urlencoded")
-        .send_string(&format!(
-            "grant_type=refresh_token&refresh_token={}&client_id={}",
-            refresh_token, CODEX_CLIENT_ID
-        ))
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
         .context("Failed to refresh Codex token")?;
 
     resp.into_json().context("Failed to parse refresh response")
@@ -252,12 +255,17 @@ pub struct CodexTokenRefreshResponse {
 }
 
 pub fn refresh_claude_token(refresh_token: &str) -> Result<ClaudeTokenRefreshResponse> {
+    let scope = claude_default_scopes().join(" ");
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLAUDE_CLIENT_ID,
+        "scope": scope
+    });
+
     let resp = ureq::post(CLAUDE_REFRESH_URL)
-        .set("Content-Type", "application/x-www-form-urlencoded")
-        .send_string(&format!(
-            "grant_type=refresh_token&refresh_token={}&client_id={}",
-            refresh_token, CLAUDE_CLIENT_ID
-        ))
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
         .context("Failed to refresh Claude token")?;
 
     resp.into_json().context("Failed to parse refresh response")
@@ -286,6 +294,63 @@ pub fn serialize_claude_credentials(creds: &ClaudeCredentialsFile) -> Result<Vec
 
 pub fn serialize_codex_auth(auth: &CodexAuthFile) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec_pretty(auth)?)
+}
+
+/// Update a saved Claude profile with refreshed tokens
+pub fn update_claude_profile_tokens(
+    profile_id: &str,
+    refreshed: &ClaudeTokenRefreshResponse,
+) -> Result<()> {
+    let profile_path = common::profiles_dir("claude")?.join(profile_id);
+    if !profile_path.exists() {
+        return Ok(());
+    }
+
+    let data = fs::read_to_string(&profile_path)?;
+    let mut creds: ClaudeCredentialsFile = serde_json::from_str(&data)?;
+
+    if let Some(ref mut oauth) = creds.claude_ai_oauth {
+        oauth.access_token = Some(refreshed.access_token.clone());
+        if let Some(ref new_rt) = refreshed.refresh_token {
+            oauth.refresh_token = Some(new_rt.clone());
+        }
+        if let Some(expires_in) = refreshed.expires_in {
+            oauth.expires_at = Some(
+                chrono::Utc::now().timestamp_millis() as f64 + (expires_in as f64 * 1000.0),
+            );
+        }
+    }
+
+    let data = serde_json::to_vec_pretty(&creds)?;
+    common::atomic_write(&profile_path, &data)
+}
+
+/// Update a saved Codex profile with refreshed tokens
+pub fn update_codex_profile_tokens(
+    profile_id: &str,
+    refreshed: &CodexTokenRefreshResponse,
+) -> Result<()> {
+    let profile_path = common::profiles_dir("codex")?.join(profile_id);
+    if !profile_path.exists() {
+        return Ok(());
+    }
+
+    let data = fs::read_to_string(&profile_path)?;
+    let mut auth_data: CodexAuthFile = serde_json::from_str(&data)?;
+
+    if let Some(ref mut tokens) = auth_data.tokens {
+        tokens.access_token = Some(refreshed.access_token.clone());
+        if let Some(ref new_id) = refreshed.id_token {
+            tokens.id_token = Some(new_id.clone());
+        }
+        if let Some(ref new_rt) = refreshed.refresh_token {
+            tokens.refresh_token = Some(new_rt.clone());
+        }
+    }
+    auth_data.last_refresh = Some(chrono::Utc::now().to_rfc3339());
+
+    let data = serde_json::to_vec_pretty(&auth_data)?;
+    common::atomic_write(&profile_path, &data)
 }
 
 /// Fetch Claude account info using the access token (rich metadata)

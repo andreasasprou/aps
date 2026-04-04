@@ -70,6 +70,13 @@ pub fn codex_auth_path() -> Result<PathBuf> {
     Ok(codex_home.join("auth.json"))
 }
 
+/// ~/.aps/claude/active or ~/.aps/codex/active — tracks last loaded profile
+pub fn active_profile_path(tool: &str) -> Result<PathBuf> {
+    let dir = aps_dir()?.join(tool);
+    fs::create_dir_all(&dir)?;
+    Ok(dir.join("active"))
+}
+
 /// Atomically write a file (write to temp, then rename)
 pub fn atomic_write(path: &PathBuf, contents: &[u8]) -> Result<()> {
     let parent = path.parent().context("No parent directory")?;

@@ -39,7 +39,7 @@ pub struct ExtraUsage {
 }
 
 fn fetch_claude_usage_once(access_token: &str) -> Result<ClaudeUsageResponse> {
-    let delays = [0, 1500]; // one retry on 429
+    let delays = [0, 2000, 4000]; // two retries on 429 with increasing backoff
     for (attempt, delay_ms) in delays.iter().enumerate() {
         if *delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
@@ -57,7 +57,7 @@ fn fetch_claude_usage_once(access_token: &str) -> Result<ClaudeUsageResponse> {
             }
             Err(ureq::Error::Status(429, _)) => {
                 if attempt == delays.len() - 1 {
-                    anyhow::bail!("Rate limited. Run `aps load claude` to switch to this account first.")
+                    anyhow::bail!("Rate limited — switch to this account with `aps load claude` to view usage")
                 }
                 // retry
             }
@@ -102,7 +102,7 @@ pub struct CodexCredits {
     pub balance: Option<serde_json::Value>,
 }
 
-fn fetch_codex_usage(access_token: &str, account_id: Option<&str>) -> Result<CodexUsageResponse> {
+fn fetch_codex_usage_once(access_token: &str, account_id: Option<&str>) -> Result<CodexUsageResponse> {
     let mut req = ureq::get("https://chatgpt.com/backend-api/wham/usage")
         .set("Authorization", &format!("Bearer {}", access_token))
         .set("Accept", "application/json")
@@ -112,23 +112,68 @@ fn fetch_codex_usage(access_token: &str, account_id: Option<&str>) -> Result<Cod
         req = req.set("ChatGPT-Account-Id", aid);
     }
 
-    let resp = req.call().context("Failed to fetch Codex usage")?;
-    resp.into_json().context("Failed to parse Codex usage response")
+    match req.call() {
+        Ok(resp) => resp.into_json().context("Failed to parse Codex usage response"),
+        Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
+            anyhow::bail!("token_expired")
+        }
+        Err(e) => Err(e).context("Failed to fetch Codex usage"),
+    }
+}
+
+/// Try fetch, refresh token on 401/403, retry
+fn fetch_codex_usage_with_refresh(
+    access_token: &str,
+    account_id: Option<&str>,
+    refresh_token: Option<&str>,
+    profile_id: Option<&str>,
+) -> Result<CodexUsageResponse> {
+    match fetch_codex_usage_once(access_token, account_id) {
+        Ok(usage) => Ok(usage),
+        Err(e) => {
+            let err_str = format!("{}", e);
+            if err_str.contains("token_expired") {
+                if let Some(rt) = refresh_token {
+                    match auth::refresh_codex_token(rt) {
+                        Ok(refreshed) => {
+                            // Persist refreshed tokens to profile
+                            if let Some(pid) = profile_id {
+                                let _ = auth::update_codex_profile_tokens(pid, &refreshed);
+                            }
+                            fetch_codex_usage_once(&refreshed.access_token, account_id)
+                        }
+                        Err(refresh_err) => anyhow::bail!(
+                            "Token expired and refresh failed: {}. Re-save with `aps save codex`",
+                            refresh_err
+                        ),
+                    }
+                } else {
+                    anyhow::bail!("Token expired (no refresh token). Re-save with `aps save codex`")
+                }
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 // ─── Parallel fetch infrastructure ───
 
 /// What kind of usage to fetch
 enum FetchJob {
-    Claude { access_token: String, refresh_token: Option<String> },
-    Codex { access_token: String, account_id: Option<String> },
+    Claude { access_token: String, refresh_token: Option<String>, profile_id: Option<String> },
+    Codex { access_token: String, account_id: Option<String>, refresh_token: Option<String>, profile_id: Option<String> },
     Inactive { message: String },
     /// Section divider (not a real fetch)
     SectionHeader { title: String },
 }
 
 /// Try fetch, refresh token on 401/403, retry
-fn fetch_claude_usage_with_refresh(access_token: &str, refresh_token: Option<&str>) -> Result<ClaudeUsageResponse> {
+fn fetch_claude_usage_with_refresh(
+    access_token: &str,
+    refresh_token: Option<&str>,
+    profile_id: Option<&str>,
+) -> Result<ClaudeUsageResponse> {
     match fetch_claude_usage_once(access_token) {
         Ok(usage) => Ok(usage),
         Err(e) => {
@@ -136,7 +181,13 @@ fn fetch_claude_usage_with_refresh(access_token: &str, refresh_token: Option<&st
             if err_str.contains("token_expired") {
                 if let Some(rt) = refresh_token {
                     match auth::refresh_claude_token(rt) {
-                        Ok(refreshed) => fetch_claude_usage_once(&refreshed.access_token),
+                        Ok(refreshed) => {
+                            // Persist refreshed tokens to profile
+                            if let Some(pid) = profile_id {
+                                let _ = auth::update_claude_profile_tokens(pid, &refreshed);
+                            }
+                            fetch_claude_usage_once(&refreshed.access_token)
+                        }
                         Err(refresh_err) => anyhow::bail!(
                             "Token expired and refresh failed: {}. Re-save with `aps save claude`",
                             refresh_err
@@ -205,9 +256,10 @@ fn status_active_parallel(tools: &[&str]) -> Result<()> {
 
                         let refresh_token = creds.claude_ai_oauth.as_ref()
                             .and_then(|o| o.refresh_token.clone());
+                        let active_pid = active.map(|(id, _, _)| id.clone());
                         jobs.push((
                             ProfileDisplay { tool: "claude".into(), plan, email, label, is_active: true },
-                            FetchJob::Claude { access_token: token, refresh_token },
+                            FetchJob::Claude { access_token: token, refresh_token, profile_id: active_pid },
                         ));
                     } else {
                         println!("  claude: {}", "No active auth".dimmed());
@@ -223,18 +275,20 @@ fn status_active_parallel(tools: &[&str]) -> Result<()> {
                         let all_profiles = profiles::get_all_profiles("codex")?;
                         let active = all_profiles.iter().find(|(_, _, a)| *a);
 
-                        let (email, plan, label, account_id) = if let Some((_, meta, _)) = active {
-                            (meta.email.clone(), meta.plan.clone(), meta.label.clone().unwrap_or_default(), meta.account_id.clone())
+                        let (email, plan, label, account_id, active_pid) = if let Some((id, meta, _)) = active {
+                            (meta.email.clone(), meta.plan.clone(), meta.label.clone().unwrap_or_default(), meta.account_id.clone(), Some(id.clone()))
                         } else {
                             match auth::extract_codex_identity(&auth_data) {
-                                Ok(id) => (id.email, id.plan, String::new(), Some(id.account_id)),
-                                Err(_) => ("(unknown)".into(), "?".into(), String::new(), None),
+                                Ok(id) => (id.email, id.plan, String::new(), Some(id.account_id), None),
+                                Err(_) => ("(unknown)".into(), "?".into(), String::new(), None, None),
                             }
                         };
 
+                        let refresh_token = auth_data.tokens.as_ref()
+                            .and_then(|t| t.refresh_token.clone());
                         jobs.push((
                             ProfileDisplay { tool: "codex".into(), plan, email, label, is_active: true },
-                            FetchJob::Codex { access_token: token, account_id },
+                            FetchJob::Codex { access_token: token, account_id, refresh_token, profile_id: active_pid },
                         ));
                     } else {
                         println!("  codex: {}", "No active auth".dimmed());
@@ -299,7 +353,7 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                             let refresh_token = fresh_creds.claude_ai_oauth.as_ref()
                                 .and_then(|o| o.refresh_token.clone());
                             if let Some(token) = auth::claude_access_token(&fresh_creds) {
-                                jobs.push((display, FetchJob::Claude { access_token: token, refresh_token }));
+                                jobs.push((display, FetchJob::Claude { access_token: token, refresh_token, profile_id: Some(id.clone()) }));
                                 continue;
                             }
                         }
@@ -311,7 +365,7 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                     let refresh_token = creds.claude_ai_oauth.as_ref()
                         .and_then(|o| o.refresh_token.clone());
                     if let Some(token) = auth::claude_access_token(&creds) {
-                        jobs.push((display, FetchJob::Claude { access_token: token, refresh_token }));
+                        jobs.push((display, FetchJob::Claude { access_token: token, refresh_token, profile_id: Some(id.clone()) }));
                     } else {
                         jobs.push((display, FetchJob::Inactive {
                             message: "No access token. Run `aps save claude` after switching to this account.".into(),
@@ -319,13 +373,28 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                     }
                 }
                 "codex" => {
+                    // For the active Codex profile, use fresh credentials from auth.json
+                    if *is_active {
+                        if let Ok(Some(fresh_auth)) = auth::read_codex_auth() {
+                            let refresh_token = fresh_auth.tokens.as_ref()
+                                .and_then(|t| t.refresh_token.clone());
+                            if let Some(token) = auth::codex_access_token(&fresh_auth) {
+                                let account_id = meta.account_id.clone();
+                                jobs.push((display, FetchJob::Codex { access_token: token, account_id, refresh_token, profile_id: Some(id.clone()) }));
+                                continue;
+                            }
+                        }
+                    }
+                    // Non-active Codex profiles: use saved token + refresh
                     let auth_data: auth::CodexAuthFile = serde_json::from_slice(&data)
                         .context(format!("Failed to parse profile {}", id))?;
+                    let refresh_token = auth_data.tokens.as_ref()
+                        .and_then(|t| t.refresh_token.clone());
                     if let Some(token) = auth::codex_access_token(&auth_data) {
                         let account_id = meta.account_id.clone();
-                        jobs.push((display, FetchJob::Codex { access_token: token, account_id }));
+                        jobs.push((display, FetchJob::Codex { access_token: token, account_id, refresh_token, profile_id: Some(id.clone()) }));
                     } else {
-                        jobs.push((display, FetchJob::Codex { access_token: String::new(), account_id: None }));
+                        jobs.push((display, FetchJob::Codex { access_token: String::new(), account_id: None, refresh_token: None, profile_id: None }));
                     }
                 }
                 _ => {}
@@ -350,32 +419,35 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
     for (idx, (_display, job)) in jobs.iter().enumerate() {
         let tx = tx.clone();
         match job {
-            FetchJob::Claude { access_token, refresh_token } => {
+            FetchJob::Claude { access_token, refresh_token, profile_id } => {
                 if access_token.is_empty() {
                     let _ = tx.send((idx, FetchResult::Claude(Err(anyhow::anyhow!("No access token")))));
                     continue;
                 }
                 let token = access_token.clone();
                 let rt = refresh_token.clone();
-                let delay_ms = claude_idx * 1000; // stagger 1s between Claude calls to avoid 429
+                let pid = profile_id.clone();
+                let delay_ms = claude_idx * 2000; // stagger 2s between Claude calls to avoid 429
                 claude_idx += 1;
                 thread::spawn(move || {
                     if delay_ms > 0 {
                         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                     }
-                    let result = fetch_claude_usage_with_refresh(&token, rt.as_deref());
+                    let result = fetch_claude_usage_with_refresh(&token, rt.as_deref(), pid.as_deref());
                     let _ = tx.send((idx, FetchResult::Claude(result)));
                 });
             }
-            FetchJob::Codex { access_token, account_id } => {
+            FetchJob::Codex { access_token, account_id, refresh_token, profile_id } => {
                 if access_token.is_empty() {
                     let _ = tx.send((idx, FetchResult::Codex(Err(anyhow::anyhow!("No access token")))));
                     continue;
                 }
                 let token = access_token.clone();
                 let aid = account_id.clone();
+                let rt = refresh_token.clone();
+                let pid = profile_id.clone();
                 thread::spawn(move || {
-                    let result = fetch_codex_usage(&token, aid.as_deref());
+                    let result = fetch_codex_usage_with_refresh(&token, aid.as_deref(), rt.as_deref(), pid.as_deref());
                     let _ = tx.send((idx, FetchResult::Codex(result)));
                 });
             }

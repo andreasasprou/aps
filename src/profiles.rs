@@ -201,6 +201,7 @@ fn save_claude() -> Result<()> {
             },
         );
         save_index("claude", &index)?;
+        let _ = write_stored_active_profile("claude", &profile_id);
 
         let org_display = org_name
             .map(|o| format!(" ({})", o))
@@ -269,6 +270,7 @@ fn save_codex() -> Result<()> {
             },
         );
         save_index("codex", &index)?;
+        let _ = write_stored_active_profile("codex", &profile_id);
 
         ui::print_success(&format!(
             "✅ Saved Codex profile: {} ({})",
@@ -323,6 +325,9 @@ pub fn load(tool: &str) -> Result<()> {
         let profile_path = common::profiles_dir(tool)?.join(profile_id);
         let data = fs::read(&profile_path)
             .context(format!("Failed to read profile file: {}", profile_id))?;
+
+        // Track active profile for reliable detection
+        let _ = write_stored_active_profile(tool, profile_id);
 
         match tool {
             "claude" => {
@@ -642,17 +647,36 @@ pub fn doctor() -> Result<()> {
 
 // ─── Helpers ───
 
+/// Read the stored active profile ID (written on `aps load`)
+fn read_stored_active_profile(tool: &str) -> Option<String> {
+    let path = common::active_profile_path(tool).ok()?;
+    fs::read_to_string(&path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Write the active profile ID to disk
+fn write_stored_active_profile(tool: &str, profile_id: &str) -> Result<()> {
+    let path = common::active_profile_path(tool)?;
+    common::atomic_write(&path, profile_id.as_bytes())
+}
+
 /// Determine which saved profile matches the currently active auth
 fn get_active_profile_id(tool: &str) -> Result<Option<String>> {
     let index = load_index(tool)?;
 
     match tool {
         "claude" => {
+            // First: check stored active profile (set by `aps load claude`)
+            if let Some(stored_id) = read_stored_active_profile("claude") {
+                if index.profiles.contains_key(&stored_id) {
+                    return Ok(Some(stored_id));
+                }
+            }
+
+            // Fallback: match by comparing tokens
             let creds = auth::read_claude_credentials()?;
             if creds.is_none() {
                 return Ok(None);
             }
-            // For Claude, we match by comparing the serialized credentials
             let creds = creds.unwrap();
             let current_token = auth::claude_access_token(&creds);
             if current_token.is_none() {
@@ -660,16 +684,15 @@ fn get_active_profile_id(tool: &str) -> Result<Option<String>> {
             }
             let current_token = current_token.unwrap();
 
-            for (id, _meta) in &index.profiles {
+            for id in index.profiles.keys() {
                 let profile_path = common::profiles_dir(tool)?.join(id);
                 if let Ok(data) = fs::read_to_string(&profile_path) {
                     if let Ok(saved_creds) = serde_json::from_str::<auth::ClaudeCredentialsFile>(&data) {
                         if let Some(saved_token) = auth::claude_access_token(&saved_creds) {
-                            // Compare access tokens (they change on refresh, so also check refresh tokens)
                             if saved_token == current_token {
+                                let _ = write_stored_active_profile("claude", id);
                                 return Ok(Some(id.clone()));
                             }
-                            // Compare refresh tokens as a fallback
                             let saved_refresh = saved_creds
                                 .claude_ai_oauth
                                 .as_ref()
@@ -681,12 +704,26 @@ fn get_active_profile_id(tool: &str) -> Result<Option<String>> {
                             if saved_refresh.is_some()
                                 && saved_refresh == current_refresh
                             {
+                                let _ = write_stored_active_profile("claude", id);
                                 return Ok(Some(id.clone()));
                             }
                         }
                     }
                 }
             }
+
+            // Last resort: fetch account email from API and match against profile metadata
+            if let Ok(info) = auth::fetch_claude_account_info(&current_token) {
+                if let Some(ref email) = info.email_address {
+                    for (id, meta) in &index.profiles {
+                        if meta.email.eq_ignore_ascii_case(email) {
+                            let _ = write_stored_active_profile("claude", id);
+                            return Ok(Some(id.clone()));
+                        }
+                    }
+                }
+            }
+
             Ok(None)
         }
         "codex" => {
