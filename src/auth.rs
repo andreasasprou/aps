@@ -496,8 +496,8 @@ fn wait_for_callback(server: tiny_http::Server) -> Result<(String, String)> {
         let key = kv.next().unwrap_or("");
         let val = kv.next().unwrap_or("");
         match key {
-            "code" => code = Some(val.to_string()),
-            "state" => state = Some(val.to_string()),
+            "code" => code = Some(urldecode(val)),
+            "state" => state = Some(urldecode(val)),
             _ => {}
         }
     }
@@ -518,6 +518,7 @@ fn exchange_code_for_tokens(
     code: &str,
     code_verifier: &str,
     redirect_uri: &str,
+    state: &str,
 ) -> Result<OAuthTokenResponse> {
     let body = serde_json::json!({
         "grant_type": "authorization_code",
@@ -525,14 +526,40 @@ fn exchange_code_for_tokens(
         "code": code,
         "code_verifier": code_verifier,
         "redirect_uri": redirect_uri,
+        "state": state,
     });
 
-    let resp = ureq::post(CLAUDE_REFRESH_URL)
+    match ureq::post(CLAUDE_REFRESH_URL)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
-        .context("Failed to exchange authorization code for tokens")?;
+    {
+        Ok(resp) => resp.into_json().context("Failed to parse token response"),
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            anyhow::bail!("Token exchange failed (HTTP {}): {}", code, body)
+        }
+        Err(e) => Err(e).context("Failed to exchange authorization code for tokens"),
+    }
+}
 
-    resp.into_json().context("Failed to parse token response")
+fn urldecode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let hi = chars.next().unwrap_or(b'0');
+            let lo = chars.next().unwrap_or(b'0');
+            let hex = [hi, lo];
+            if let Ok(val) = u8::from_str_radix(std::str::from_utf8(&hex).unwrap_or("00"), 16) {
+                result.push(val as char);
+            }
+        } else if b == b'+' {
+            result.push(' ');
+        } else {
+            result.push(b as char);
+        }
+    }
+    result
 }
 
 /// Full OAuth PKCE flow for Claude: opens browser, gets tokens, saves profile
@@ -549,7 +576,7 @@ pub fn oauth_claude(label: Option<&str>) -> Result<()> {
     // Start local callback server
     let server = start_callback_server()?;
     let port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(9876);
-    let redirect_uri = format!("http://127.0.0.1:{}/callback", port);
+    let redirect_uri = format!("http://localhost:{}/callback", port);
 
     let scope = claude_default_scopes().join(" ");
 
@@ -583,7 +610,7 @@ pub fn oauth_claude(label: Option<&str>) -> Result<()> {
     println!();
     print!("{}", "Exchanging code for tokens... ".dimmed());
 
-    let tokens = exchange_code_for_tokens(&code, &code_verifier, &redirect_uri)?;
+    let tokens = exchange_code_for_tokens(&code, &code_verifier, &redirect_uri, &state)?;
     println!("{}", "OK".green());
 
     // Fetch account info to get email + metadata

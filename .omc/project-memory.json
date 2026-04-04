@@ -1,0 +1,141 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1775295707790,
+  "projectRoot": "/Users/andreasasprou/projects/agents-profile-switcher",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Rust",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Cargo.toml"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "cargo",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "cargo build",
+    "testCommand": "cargo test",
+    "lintCommand": "cargo clippy",
+    "devCommand": "cargo run",
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "src"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 8,
+      "lastAccessed": 1775295707762,
+      "keyFiles": [
+        "auth.rs",
+        "cli.rs",
+        "common.rs",
+        "costs.rs",
+        "main.rs"
+      ]
+    },
+    "target": {
+      "path": "target",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1775295707767,
+      "keyFiles": [
+        "CACHEDIR.TAG"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "src/profiles.rs",
+      "accessCount": 32,
+      "lastAccessed": 1775304758463,
+      "type": "file"
+    },
+    {
+      "path": "src/usage.rs",
+      "accessCount": 28,
+      "lastAccessed": 1775304759049,
+      "type": "file"
+    },
+    {
+      "path": "src/auth.rs",
+      "accessCount": 26,
+      "lastAccessed": 1775305027761,
+      "type": "file"
+    },
+    {
+      "path": "src/main.rs",
+      "accessCount": 12,
+      "lastAccessed": 1775304755434,
+      "type": "file"
+    },
+    {
+      "path": "src/cli.rs",
+      "accessCount": 10,
+      "lastAccessed": 1775304188656,
+      "type": "file"
+    },
+    {
+      "path": "src/common.rs",
+      "accessCount": 10,
+      "lastAccessed": 1775304758993,
+      "type": "file"
+    },
+    {
+      "path": "src",
+      "accessCount": 9,
+      "lastAccessed": 1775304180771,
+      "type": "directory"
+    },
+    {
+      "path": "Cargo.toml",
+      "accessCount": 7,
+      "lastAccessed": 1775304752696,
+      "type": "file"
+    },
+    {
+      "path": "",
+      "accessCount": 4,
+      "lastAccessed": 1775303786975,
+      "type": "directory"
+    },
+    {
+      "path": "src/ui.rs",
+      "accessCount": 4,
+      "lastAccessed": 1775303794813,
+      "type": "file"
+    },
+    {
+      "path": "src/costs.rs",
+      "accessCount": 4,
+      "lastAccessed": 1775303795039,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 2,
+      "lastAccessed": 1775304752225,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}
