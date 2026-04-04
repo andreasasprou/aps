@@ -21,6 +21,19 @@ pub enum Commands {
     Save {
         /// Tool to save profile for (claude or codex)
         tool: String,
+
+        /// Save from a setup token (1-year access token from `claude setup-token`).
+        /// Also accepts CLAUDE_CODE_OAUTH_TOKEN values.
+        #[arg(long)]
+        from_token: Option<String>,
+
+        /// Save from a refresh token (from ~/.claude/.credentials.json).
+        #[arg(long, conflicts_with = "from_token")]
+        from_refresh_token: Option<String>,
+
+        /// Label for the profile (skips interactive prompt)
+        #[arg(long, short)]
+        label: Option<String>,
     },
     /// Load a saved profile (interactive picker)
     Load {

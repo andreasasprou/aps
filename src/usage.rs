@@ -194,7 +194,7 @@ fn fetch_claude_usage_with_refresh(
                         ),
                     }
                 } else {
-                    anyhow::bail!("Token expired (no refresh token). Re-save with `aps save claude`")
+                    anyhow::bail!("Token expired (setup token). Generate a new one with `claude setup-token`")
                 }
             } else {
                 Err(e)

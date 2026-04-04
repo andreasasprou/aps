@@ -65,6 +65,38 @@ pub fn read_claude_keychain() -> Result<Option<ClaudeCredentialsFile>> {
     Ok(None)
 }
 
+/// Write Claude credentials to macOS Keychain
+#[cfg(target_os = "macos")]
+pub fn write_claude_keychain(creds: &ClaudeCredentialsFile) -> Result<()> {
+    let json_str = serde_json::to_string(creds)?;
+
+    // Delete existing entry first (add-generic-password -U can be flaky with long values)
+    let _ = std::process::Command::new("security")
+        .args(["delete-generic-password", "-s", "Claude Code-credentials"])
+        .output();
+
+    let output = std::process::Command::new("security")
+        .args([
+            "add-generic-password",
+            "-s", "Claude Code-credentials",
+            "-a", "Claude Code-credentials",
+            "-w", &json_str,
+        ])
+        .output()
+        .context("Failed to run security command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to write to keychain: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn write_claude_keychain(_creds: &ClaudeCredentialsFile) -> Result<()> {
+    Ok(()) // No-op on non-macOS
+}
+
 /// Get Claude credentials from file first, then keychain
 pub fn read_claude_credentials() -> Result<Option<ClaudeCredentialsFile>> {
     if let Some(creds) = read_claude_credentials_file()? {
@@ -86,14 +118,18 @@ pub fn is_claude_token_expired(creds: &ClaudeCredentialsFile) -> bool {
         return true;
     };
     let Some(expires_at_ms) = oauth.expires_at else {
-        return true; // no expiry = assume expired
+        // Setup tokens have no expiry and no refresh token — treat as not expired
+        if oauth.refresh_token.is_none() {
+            return false;
+        }
+        return true; // OAuth token with missing expiry = assume expired
     };
     let now_ms = chrono::Utc::now().timestamp_millis() as f64;
     let buffer_ms = 5.0 * 60.0 * 1000.0; // 5 minutes
     now_ms + buffer_ms >= expires_at_ms
 }
 
-/// Save Claude credentials to file
+/// Save Claude credentials to file and keychain
 pub fn write_claude_credentials(creds: &ClaudeCredentialsFile) -> Result<()> {
     let path = common::claude_credentials_path()?;
     let data = serde_json::to_string_pretty(creds)?;
@@ -103,7 +139,13 @@ pub fn write_claude_credentials(creds: &ClaudeCredentialsFile) -> Result<()> {
     lock.lock().context("Failed to acquire Claude credential lock")?;
     let result = common::atomic_write(&path, data.as_bytes());
     lock.unlock().ok();
-    result
+    result?;
+
+    // Also write to keychain so Claude Code picks it up (it reads keychain first)
+    if let Err(e) = write_claude_keychain(creds) {
+        eprintln!("Warning: could not update keychain: {}", e);
+    }
+    Ok(())
 }
 
 // ─── Codex Auth ───

@@ -88,17 +88,25 @@ fn codex_profile_id(email: &str, plan: &str) -> String {
 
 // ─── Commands ───
 
-pub fn save(tool: &str) -> Result<()> {
+pub fn save(tool: &str, from_token: Option<&str>, from_refresh_token: Option<&str>, label_override: Option<&str>) -> Result<()> {
     let tool = common::validate_tool(tool)?;
 
     match tool {
-        "claude" => save_claude(),
-        "codex" => save_codex(),
+        "claude" => {
+            if let Some(token) = from_token {
+                save_claude_from_token(token, label_override)
+            } else if let Some(rt) = from_refresh_token {
+                save_claude_from_refresh_token(rt, label_override)
+            } else {
+                save_claude(label_override)
+            }
+        }
+        "codex" => save_codex(label_override),
         _ => unreachable!(),
     }
 }
 
-fn save_claude() -> Result<()> {
+fn save_claude(label_override: Option<&str>) -> Result<()> {
     let creds = auth::read_claude_credentials()?
         .context("No Claude credentials found. Run `claude` to authenticate first.")?;
 
@@ -155,12 +163,16 @@ fn save_claude() -> Result<()> {
     let rate_limit_tier = oauth.rate_limit_tier.clone();
     let profile_id = claude_profile_id(&email, &plan);
 
-    // Ask for optional label
-    let label = inquire::Text::new("Label (optional):")
-        .with_default("")
-        .prompt()
-        .ok()
-        .filter(|s| !s.is_empty());
+    // Ask for optional label (or use override from --label flag)
+    let label = if let Some(l) = label_override {
+        Some(l.to_string())
+    } else {
+        inquire::Text::new("Label (optional):")
+            .with_default("")
+            .prompt()
+            .ok()
+            .filter(|s| !s.is_empty())
+    };
 
     with_lock("claude", || {
         let mut index = load_index("claude")?;
@@ -214,20 +226,242 @@ fn save_claude() -> Result<()> {
     })
 }
 
-fn save_codex() -> Result<()> {
+/// Save a Claude profile from a setup token (1-year access token from `claude setup-token`)
+fn save_claude_from_token(access_token: &str, label_override: Option<&str>) -> Result<()> {
+    // Fetch account info to get email/plan metadata
+    print!("{}", "Fetching account info... ".dimmed());
+    let (email, account_id, display_name, org_name, org_uuid, plan) =
+        match auth::fetch_claude_account_info(access_token) {
+            Ok(info) => {
+                println!("{}", "OK".green());
+                let org = info
+                    .memberships
+                    .as_ref()
+                    .and_then(|m| m.first())
+                    .and_then(|m| m.organization.as_ref());
+                (
+                    info.email_address.unwrap_or_else(|| "unknown".into()),
+                    info.uuid,
+                    info.display_name,
+                    org.and_then(|o| o.name.clone()),
+                    org.and_then(|o| o.uuid.clone()),
+                    "max".to_string(),
+                )
+            }
+            Err(e) => {
+                println!("{}", "failed".yellow());
+                ui::print_warning(&format!("Could not fetch account info: {}. Enter manually.", e));
+                let email = inquire::Text::new("Email for this profile:")
+                    .prompt()
+                    .context("Prompt cancelled")?;
+                (email, None, None, None, None, "max".to_string())
+            }
+        };
+
+    let profile_id = claude_profile_id(&email, &plan);
+
+    let creds = auth::ClaudeCredentialsFile {
+        claude_ai_oauth: Some(auth::ClaudeOAuth {
+            access_token: Some(access_token.to_string()),
+            refresh_token: None,
+            expires_at: None, // Claude Code treats null as "not expired"
+            scopes: Some(vec!["user:inference".into()]),
+            rate_limit_tier: None,
+            subscription_type: Some(plan.clone()),
+        }),
+    };
+
+    let label = if let Some(l) = label_override {
+        Some(l.to_string())
+    } else {
+        inquire::Text::new("Label (optional):")
+            .with_default("")
+            .prompt()
+            .ok()
+            .filter(|s| !s.is_empty())
+    };
+
+    with_lock("claude", || {
+        let mut index = load_index("claude")?;
+
+        if index.profiles.contains_key(&profile_id) {
+            let overwrite = inquire::Confirm::new(&format!(
+                "Profile '{}' already exists. Overwrite?",
+                profile_id
+            ))
+            .with_default(true)
+            .prompt()
+            .unwrap_or(false);
+
+            if !overwrite {
+                println!("{}", "Save cancelled.".dimmed());
+                return Ok(());
+            }
+        }
+
+        let profile_path = common::profiles_dir("claude")?.join(&profile_id);
+        let data = auth::serialize_claude_credentials(&creds)?;
+        common::atomic_write(&profile_path, &data)?;
+
+        index.profiles.insert(
+            profile_id.clone(),
+            ProfileMeta {
+                email: email.clone(),
+                plan: plan.clone(),
+                plan_type_key: plan.to_lowercase(),
+                label,
+                account_id,
+                principal_id: None,
+                workspace_or_org_id: org_uuid.clone(),
+                display_name,
+                org_name: org_name.clone(),
+                org_uuid,
+                rate_limit_tier: None,
+            },
+        );
+        save_index("claude", &index)?;
+
+        let org_display = org_name.map(|o| format!(" ({})", o)).unwrap_or_default();
+        ui::print_success(&format!(
+            "Saved Claude profile (setup token): {} ({}){}",
+            profile_id, email, org_display
+        ));
+        Ok(())
+    })
+}
+
+/// Save a Claude profile from a refresh token (skips browser login)
+fn save_claude_from_refresh_token(refresh_token: &str, label_override: Option<&str>) -> Result<()> {
+    print!("{}", "Refreshing token... ".dimmed());
+    let refreshed = auth::refresh_claude_token(refresh_token)
+        .context("Failed to refresh token. Is the refresh token valid?")?;
+    println!("{}", "OK".green());
+
+    print!("{}", "Fetching account info... ".dimmed());
+    let (email, account_id, display_name, org_name, org_uuid, plan, rate_limit_tier) =
+        match auth::fetch_claude_account_info(&refreshed.access_token) {
+            Ok(info) => {
+                println!("{}", "OK".green());
+                let org = info
+                    .memberships
+                    .as_ref()
+                    .and_then(|m| m.first())
+                    .and_then(|m| m.organization.as_ref());
+                (
+                    info.email_address.unwrap_or_else(|| "unknown".into()),
+                    info.uuid,
+                    info.display_name,
+                    org.and_then(|o| o.name.clone()),
+                    org.and_then(|o| o.uuid.clone()),
+                    "max".to_string(),
+                    None::<String>,
+                )
+            }
+            Err(e) => {
+                println!("{}", "failed".yellow());
+                ui::print_warning(&format!("Could not fetch account info: {}. Enter manually.", e));
+                let email = inquire::Text::new("Email for this profile:")
+                    .prompt()
+                    .context("Prompt cancelled")?;
+                (email, None, None, None, None, "max".to_string(), None)
+            }
+        };
+
+    let profile_id = claude_profile_id(&email, &plan);
+    let new_refresh_token = refreshed.refresh_token.unwrap_or_else(|| refresh_token.to_string());
+    let expires_at = refreshed.expires_in.map(|secs| {
+        chrono::Utc::now().timestamp_millis() as f64 + (secs as f64 * 1000.0)
+    });
+
+    let creds = auth::ClaudeCredentialsFile {
+        claude_ai_oauth: Some(auth::ClaudeOAuth {
+            access_token: Some(refreshed.access_token),
+            refresh_token: Some(new_refresh_token),
+            expires_at,
+            scopes: Some(auth::claude_default_scopes()),
+            rate_limit_tier: rate_limit_tier.clone(),
+            subscription_type: Some(plan.clone()),
+        }),
+    };
+
+    let label = if let Some(l) = label_override {
+        Some(l.to_string())
+    } else {
+        inquire::Text::new("Label (optional):")
+            .with_default("")
+            .prompt()
+            .ok()
+            .filter(|s| !s.is_empty())
+    };
+
+    with_lock("claude", || {
+        let mut index = load_index("claude")?;
+
+        if index.profiles.contains_key(&profile_id) {
+            let overwrite = inquire::Confirm::new(&format!(
+                "Profile '{}' already exists. Overwrite?",
+                profile_id
+            ))
+            .with_default(true)
+            .prompt()
+            .unwrap_or(false);
+
+            if !overwrite {
+                println!("{}", "Save cancelled.".dimmed());
+                return Ok(());
+            }
+        }
+
+        let profile_path = common::profiles_dir("claude")?.join(&profile_id);
+        let data = auth::serialize_claude_credentials(&creds)?;
+        common::atomic_write(&profile_path, &data)?;
+
+        index.profiles.insert(
+            profile_id.clone(),
+            ProfileMeta {
+                email: email.clone(),
+                plan: plan.clone(),
+                plan_type_key: plan.to_lowercase(),
+                label,
+                account_id,
+                principal_id: None,
+                workspace_or_org_id: org_uuid.clone(),
+                display_name,
+                org_name: org_name.clone(),
+                org_uuid,
+                rate_limit_tier,
+            },
+        );
+        save_index("claude", &index)?;
+        let _ = write_stored_active_profile("claude", &profile_id);
+
+        let org_display = org_name.map(|o| format!(" ({})", o)).unwrap_or_default();
+        ui::print_success(&format!(
+            "Saved Claude profile: {} ({}){}",
+            profile_id, email, org_display
+        ));
+        Ok(())
+    })
+}
+
+fn save_codex(label_override: Option<&str>) -> Result<()> {
     let auth_data = auth::read_codex_auth()?
         .context("No Codex auth found. Run `codex` to authenticate first.")?;
 
     let identity = auth::extract_codex_identity(&auth_data)?;
     let profile_id = codex_profile_id(&identity.email, &identity.plan_type_key);
 
-    // Ask for optional label
-    let default_label = identity.email.split('@').next().unwrap_or("").to_string();
-    let label = inquire::Text::new("Label (optional):")
-        .with_default(&default_label)
-        .prompt()
-        .ok()
-        .filter(|s| !s.is_empty());
+    // Ask for optional label (or use override from --label flag)
+    let label = if let Some(l) = label_override {
+        Some(l.to_string())
+    } else {
+        let default_label = identity.email.split('@').next().unwrap_or("").to_string();
+        inquire::Text::new("Label (optional):")
+            .with_default(&default_label)
+            .prompt()
+            .ok()
+            .filter(|s| !s.is_empty())
+    };
 
     with_lock("codex", || {
         let mut index = load_index("codex")?;
@@ -337,9 +571,10 @@ pub fn load(tool: &str) -> Result<()> {
                 auth::write_claude_credentials(&creds)?;
                 ui::print_success(&format!("✅ Loaded Claude profile: {}", profile_id));
 
-                // Also print env var for fast session switching
+                // Print env var hints for fast session switching
                 if let Some(ref oauth) = creds.claude_ai_oauth {
                     if let Some(ref rt) = oauth.refresh_token {
+                        // Normal OAuth profile — show refresh token hint
                         let scopes = oauth
                             .scopes
                             .as_ref()
@@ -357,6 +592,17 @@ pub fn load(tool: &str) -> Result<()> {
                         println!(
                             "  export CLAUDE_CODE_OAUTH_SCOPES={}",
                             scopes
+                        );
+                    } else if let Some(ref token) = oauth.access_token {
+                        // Setup token profile — show access token hint
+                        println!();
+                        println!(
+                            "{}",
+                            "For instant switching in new shells, run:".dimmed()
+                        );
+                        println!(
+                            "  export CLAUDE_CODE_OAUTH_TOKEN={}",
+                            token
                         );
                     }
                 }

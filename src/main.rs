@@ -18,7 +18,9 @@ fn main() {
     }
 
     let result = match cli.command {
-        Commands::Save { tool } => profiles::save(&tool),
+        Commands::Save { tool, from_token, from_refresh_token, label } => {
+            profiles::save(&tool, from_token.as_deref(), from_refresh_token.as_deref(), label.as_deref())
+        }
         Commands::Load { tool } => profiles::load(&tool),
         Commands::List { tool } => profiles::list(tool.as_deref()),
         Commands::Current { tool } => profiles::current(tool.as_deref()),
