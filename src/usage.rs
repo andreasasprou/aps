@@ -649,6 +649,12 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                 _ => format!("  \u{2500}\u{2500}\u{2500} {}", t.bold()),
             };
             println!("{}", styled_title);
+            if !rows.is_empty() {
+                println!("  {}",
+                    format!("{:>3} {:>5}  {:<13} {:<20} {:<12} {:<8}",
+                        "", "", "", "", "weekly", "5 hour").dimmed()
+                );
+            }
         }
 
         // Sort by weekly remaining DESC (errors/unknown go to bottom)
