@@ -468,7 +468,13 @@ struct ClaudeJobInfo {
     is_active: bool,
 }
 
-/// Fire fetches: Claude jobs serialized in one thread, Codex jobs parallel
+/// A collected row ready for sorting and rendering
+struct CollectedRow {
+    display: ProfileDisplay,
+    result: FetchResult,
+}
+
+/// Fire fetches, collect ALL results, sort by weekly remaining DESC per tool section, render dashboard rows
 fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
     if jobs.is_empty() {
         return Ok(());
@@ -509,7 +515,6 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                     let result = fetch_codex_usage_with_refresh(&token, aid.as_deref(), rt.as_deref(), pid.as_deref());
                     let (fetch_result, cache_suffix) = match result {
                         Ok(usage) => {
-                            // Cache on success
                             if let Some(ref p) = pid {
                                 write_usage_cache("codex", p, &usage);
                             }
@@ -518,7 +523,6 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                         Err(e) => {
                             let err_str = format!("{}", e);
                             if err_str.contains("rate_limited") {
-                                // Try cache fallback
                                 if let Some(ref p) = pid {
                                     if let Some((cached, suffix)) = read_codex_cache(p) {
                                         let _ = tx.send((idx, FetchResult::Codex(Ok(cached), Some(suffix))));
@@ -553,7 +557,6 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
         let tx = tx.clone();
         thread::spawn(move || {
             for (i, job) in claude_jobs.iter().enumerate() {
-                // Active profile goes first with no delay; non-active get 3s gap
                 if i > 0 {
                     std::thread::sleep(std::time::Duration::from_secs(3));
                 }
@@ -564,7 +567,6 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                 );
                 let (fetch_result, cache_suffix) = match result {
                     Ok(usage) => {
-                        // Cache on success
                         if let Some(ref p) = job.profile_id {
                             write_usage_cache("claude", p, &usage);
                         }
@@ -573,7 +575,6 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                     Err(e) => {
                         let err_str = format!("{}", e);
                         if err_str.contains("rate_limited") {
-                            // Try cache fallback
                             if let Some(ref p) = job.profile_id {
                                 if let Some((cached, suffix)) = read_claude_cache(p) {
                                     let _ = tx.send((job.idx, FetchResult::Claude(Ok(cached), Some(suffix))));
@@ -582,7 +583,6 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                             }
                             (Err(anyhow::anyhow!("Rate limited — switch to this account with `aps load claude` to view usage")), None)
                         } else if err_str.contains("token_expired") {
-                            // Don't use cache for genuinely broken tokens
                             (Err(e), None)
                         } else {
                             (Err(e), None)
@@ -596,151 +596,221 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
 
     drop(tx); // Close sender so rx iterator ends
 
-    // Collect results, display in original order
+    // Collect ALL results first (wait for everything)
     let mut results: Vec<Option<FetchResult>> = (0..count).map(|_| None).collect();
-    let mut displayed_up_to = 0;
-
     for (idx, result) in rx {
         results[idx] = Some(result);
+    }
 
-        // Display any contiguous results starting from where we left off
-        while displayed_up_to < count {
-            if results[displayed_up_to].is_none() {
-                break;
+    // Build collected rows, grouping by tool sections
+    let mut sections: Vec<(Option<String>, Vec<CollectedRow>)> = Vec::new();
+    let mut current_section_rows: Vec<CollectedRow> = Vec::new();
+    let mut current_section_title: Option<String> = None;
+    // Track whether we have seen any section header at all
+    let mut has_sections = false;
+
+    for (idx, result_opt) in results.into_iter().enumerate() {
+        let result = result_opt.unwrap();
+        let display = &jobs[idx].0;
+
+        if let FetchResult::Section(ref title) = result {
+            has_sections = true;
+            // Push previous section if any
+            if current_section_title.is_some() || !current_section_rows.is_empty() {
+                sections.push((current_section_title.take(), std::mem::take(&mut current_section_rows)));
             }
-            let display = &jobs[displayed_up_to].0;
-            let result = results[displayed_up_to].take().unwrap();
+            current_section_title = Some(title.clone());
+            continue;
+        }
 
-            // Section headers get special rendering
-            if let FetchResult::Section(ref title) = result {
-                println!();
-                let styled_title = match title.as_str() {
-                    // Anthropic brand color #D97757
-                    "Claude Code" => format!("  ─── {}", title.truecolor(217, 119, 87).bold()),
-                    // Codex = white
-                    "Codex" => format!("  ─── {}", title.white().bold()),
-                    _ => format!("  ─── {}", title.bold()),
-                };
-                println!("{}", styled_title);
-                displayed_up_to += 1;
-                continue;
-            }
+        current_section_rows.push(CollectedRow {
+            display: ProfileDisplay {
+                tool: display.tool.clone(),
+                plan: display.plan.clone(),
+                email: display.email.clone(),
+                label: display.label.clone(),
+                is_active: display.is_active,
+            },
+            result,
+        });
+    }
+    // Push last section
+    if current_section_title.is_some() || !current_section_rows.is_empty() {
+        sections.push((current_section_title, current_section_rows));
+    }
 
-            ui::render_profile_header_with_tool(
-                &display.tool,
-                &display.plan,
-                &display.email,
-                &display.label,
-                display.is_active,
-            );
+    // Render each section: sort rows by weekly remaining DESC, then print
+    for (title, mut rows) in sections {
+        if let Some(ref t) = title {
+            println!();
+            let styled_title = match t.as_str() {
+                "Claude Code" => format!("  \u{2500}\u{2500}\u{2500} {}", t.truecolor(217, 119, 87).bold()),
+                "Codex" => format!("  \u{2500}\u{2500}\u{2500} {}", t.white().bold()),
+                _ => format!("  \u{2500}\u{2500}\u{2500} {}", t.bold()),
+            };
+            println!("{}", styled_title);
+        }
 
-            match result {
-                FetchResult::Claude(Ok(usage), cache_suffix) => {
-                    if let Some(ref suffix) = cache_suffix {
-                        println!("    {}", suffix.dimmed());
-                    }
-                    print_claude_usage(&usage, 4);
-                }
-                FetchResult::Claude(Err(e), _) => {
-                    println!("    {}", format!("Failed to fetch usage: {}", e).red());
-                }
-                FetchResult::Codex(Ok(usage), cache_suffix) => {
-                    if let Some(ref suffix) = cache_suffix {
-                        println!("    {}", suffix.dimmed());
-                    }
-                    print_codex_usage(&usage, 4);
-                }
-                FetchResult::Codex(Err(e), _) => {
-                    println!("    {}", format!("Failed to fetch usage: {}", e).red());
-                }
-                FetchResult::Skipped(msg) => {
-                    println!("    {}", msg.dimmed());
-                }
-                FetchResult::Section(_) => unreachable!(),
-            }
+        // Sort by weekly remaining DESC (errors/unknown go to bottom)
+        rows.sort_by(|a, b| {
+            let a_pct = extract_weekly_remaining_pct(&a.display.tool, &a.result);
+            let b_pct = extract_weekly_remaining_pct(&b.display.tool, &b.result);
+            b_pct.cmp(&a_pct) // descending
+        });
 
-            displayed_up_to += 1;
+        // Add blank line before rows
+        if !rows.is_empty() && !has_sections {
+            println!();
+        }
+
+        for row in &rows {
+            let dashboard_row = build_dashboard_row(&row.display, &row.result);
+            ui::render_dashboard_row(&dashboard_row);
         }
     }
 
+    println!();
     Ok(())
 }
 
-// ─── Rendering (pure, no fetching) ───
-
-fn print_claude_usage(usage: &ClaudeUsageResponse, indent: usize) {
-    // Claude API returns utilization as percentage (0-100), convert to fraction (0.0-1.0)
-    if let Some(ref w) = usage.five_hour {
-        if let Some(util) = w.utilization {
-            let reset = format_reset_time(w.resets_at.as_deref());
-            ui::render_usage_bar("5 hour", util / 100.0, &reset, indent);
+/// Extract weekly remaining percentage from a fetch result (for sorting)
+fn extract_weekly_remaining_pct(_tool: &str, result: &FetchResult) -> u32 {
+    match result {
+        FetchResult::Claude(Ok(usage), _) => {
+            if let Some(ref w) = usage.seven_day {
+                if let Some(util) = w.utilization {
+                    return (100.0 - util.clamp(0.0, 100.0)).round() as u32;
+                }
+            }
+            0
         }
-    }
-    if let Some(ref w) = usage.seven_day {
-        if let Some(util) = w.utilization {
-            let reset = format_reset_time(w.resets_at.as_deref());
-            ui::render_usage_bar("Weekly", util / 100.0, &reset, indent);
+        FetchResult::Codex(Ok(usage), _) => {
+            if let Some(ref rl) = usage.rate_limit {
+                if let Some(ref w) = rl.secondary_window {
+                    if let Some(pct) = w.used_percent {
+                        return (100.0 - pct.clamp(0.0, 100.0)).round() as u32;
+                    }
+                }
+            }
+            0
         }
-    }
-    if let Some(ref w) = usage.seven_day_opus {
-        if let Some(util) = w.utilization {
-            let reset = format_reset_time(w.resets_at.as_deref());
-            let prefix = " ".repeat(indent);
-            println!("{}{}:", prefix, "opus".bold());
-            ui::render_usage_bar("  Weekly", util / 100.0, &reset, indent);
-        }
-    }
-    if let Some(ref w) = usage.seven_day_sonnet {
-        if let Some(util) = w.utilization {
-            let reset = format_reset_time(w.resets_at.as_deref());
-            let prefix = " ".repeat(indent);
-            println!("{}{}:", prefix, "sonnet".bold());
-            ui::render_usage_bar("  Weekly", util / 100.0, &reset, indent);
-        }
-    }
-    if let Some(ref extra) = usage.extra_usage {
-        if extra.is_enabled == Some(true) {
-            let prefix = " ".repeat(indent);
-            let currency = extra.currency.as_deref().unwrap_or("USD");
-            // API returns values in cents
-            let limit = extra.monthly_limit.unwrap_or(0.0) / 100.0;
-            let used = extra.used_credits.unwrap_or(0.0) / 100.0;
-            println!(
-                "{}Extra credits: ${:.2}/${:.2} {} spent",
-                prefix, used, limit, currency
-            );
-        }
+        _ => 0,
     }
 }
 
-fn print_codex_usage(usage: &CodexUsageResponse, indent: usize) {
-    if let Some(ref rl) = usage.rate_limit {
-        if let Some(ref w) = rl.primary_window {
-            if let Some(pct) = w.used_percent {
-                let util = pct / 100.0;
-                let reset = w
-                    .reset_at
-                    .map(|ts| format_unix_reset(ts as i64))
-                    .unwrap_or_default();
-                let prefix = " ".repeat(indent);
-                println!("{}{}:", prefix, "codex".bold());
-                ui::render_usage_bar("  5 hour", util, &reset, indent);
+/// Build a DashboardRow from profile display info and fetch result
+fn build_dashboard_row(display: &ProfileDisplay, result: &FetchResult) -> ui::DashboardRow {
+    let mut row = ui::DashboardRow {
+        tool: display.tool.clone(),
+        plan: display.plan.clone(),
+        label: display.label.clone(),
+        email: display.email.clone(),
+        is_active: display.is_active,
+        weekly_remaining_pct: None,
+        five_hour_remaining_pct: None,
+        weekly_reset: String::new(),
+        extra_credits: String::new(),
+        cache_suffix: String::new(),
+        error: String::new(),
+    };
+
+    match result {
+        FetchResult::Claude(Ok(usage), cache_suffix) => {
+            // Weekly (7-day) — hero metric
+            if let Some(ref w) = usage.seven_day {
+                if let Some(util) = w.utilization {
+                    row.weekly_remaining_pct = Some((100.0 - util.clamp(0.0, 100.0)).round() as u32);
+                    row.weekly_reset = format_reset_compact(w.resets_at.as_deref());
+                }
+            }
+            // 5-hour
+            if let Some(ref w) = usage.five_hour {
+                if let Some(util) = w.utilization {
+                    row.five_hour_remaining_pct = Some((100.0 - util.clamp(0.0, 100.0)).round() as u32);
+                }
+            }
+            // Extra credits
+            if let Some(ref extra) = usage.extra_usage {
+                if extra.is_enabled == Some(true) {
+                    let used_cents = extra.used_credits.unwrap_or(0.0);
+                    if used_cents > 0.0 {
+                        let used_dollars = used_cents / 100.0;
+                        row.extra_credits = format!("+${:.0}", used_dollars);
+                    }
+                }
+            }
+            if let Some(ref suffix) = cache_suffix {
+                row.cache_suffix = suffix.clone();
             }
         }
-        if let Some(ref w) = rl.secondary_window {
-            if let Some(pct) = w.used_percent {
-                let util = pct / 100.0;
-                let reset = w
-                    .reset_at
-                    .map(|ts| format_unix_reset(ts as i64))
-                    .unwrap_or_default();
-                ui::render_usage_bar("  Weekly", util, &reset, indent);
+        FetchResult::Codex(Ok(usage), cache_suffix) => {
+            // Weekly (secondary window) — hero metric
+            if let Some(ref rl) = usage.rate_limit {
+                if let Some(ref w) = rl.secondary_window {
+                    if let Some(pct) = w.used_percent {
+                        row.weekly_remaining_pct = Some((100.0 - pct.clamp(0.0, 100.0)).round() as u32);
+                        row.weekly_reset = w.reset_at
+                            .map(|ts| format_unix_reset_compact(ts as i64))
+                            .unwrap_or_default();
+                    }
+                }
+                // 5-hour (primary window)
+                if let Some(ref w) = rl.primary_window {
+                    if let Some(pct) = w.used_percent {
+                        row.five_hour_remaining_pct = Some((100.0 - pct.clamp(0.0, 100.0)).round() as u32);
+                    }
+                }
+            }
+            if let Some(ref suffix) = cache_suffix {
+                row.cache_suffix = suffix.clone();
             }
         }
+        FetchResult::Claude(Err(e), _) => {
+            row.error = format!("{}", e);
+        }
+        FetchResult::Codex(Err(e), _) => {
+            row.error = format!("{}", e);
+        }
+        FetchResult::Skipped(msg) => {
+            row.error = msg.clone();
+        }
+        FetchResult::Section(_) => {}
     }
+
+    row
 }
 
 // ─── Time formatting ───
+
+/// Compact reset time for dashboard rows: "14:00" (today) or "7 Apr" (other day)
+fn format_reset_compact(iso: Option<&str>) -> String {
+    if let Some(s) = iso {
+        if let Ok(dt) = s.parse::<DateTime<Utc>>() {
+            let local: DateTime<Local> = dt.into();
+            let now = Local::now();
+            if local.date_naive() == now.date_naive() {
+                return local.format("%H:%M").to_string();
+            } else {
+                return local.format("%-d %b").to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Compact reset time from unix timestamp
+fn format_unix_reset_compact(ts: i64) -> String {
+    if let Some(dt) = DateTime::from_timestamp(ts, 0) {
+        let local: DateTime<Local> = dt.into();
+        let now = Local::now();
+        if local.date_naive() == now.date_naive() {
+            return local.format("%H:%M").to_string();
+        } else {
+            return local.format("%-d %b").to_string();
+        }
+    }
+    String::new()
+}
 
 fn format_reset_time(iso: Option<&str>) -> String {
     if let Some(s) = iso {
