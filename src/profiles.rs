@@ -228,35 +228,15 @@ fn save_claude(label_override: Option<&str>) -> Result<()> {
 
 /// Save a Claude profile from a setup token (1-year access token from `claude setup-token`)
 fn save_claude_from_token(access_token: &str, label_override: Option<&str>) -> Result<()> {
-    // Fetch account info to get email/plan metadata
-    print!("{}", "Fetching account info... ".dimmed());
-    let (email, account_id, display_name, org_name, org_uuid, plan) =
-        match auth::fetch_claude_account_info(access_token) {
-            Ok(info) => {
-                println!("{}", "OK".green());
-                let org = info
-                    .memberships
-                    .as_ref()
-                    .and_then(|m| m.first())
-                    .and_then(|m| m.organization.as_ref());
-                (
-                    info.email_address.unwrap_or_else(|| "unknown".into()),
-                    info.uuid,
-                    info.display_name,
-                    org.and_then(|o| o.name.clone()),
-                    org.and_then(|o| o.uuid.clone()),
-                    "max".to_string(),
-                )
-            }
-            Err(e) => {
-                println!("{}", "failed".yellow());
-                ui::print_warning(&format!("Could not fetch account info: {}. Enter manually.", e));
-                let email = inquire::Text::new("Email for this profile:")
-                    .prompt()
-                    .context("Prompt cancelled")?;
-                (email, None, None, None, None, "max".to_string())
-            }
-        };
+    // Setup tokens only have user:inference scope — can't call account API.
+    // Prompt for email directly.
+    println!("{}", "Setup tokens are inference-only — enter account details:".dimmed());
+    let email = inquire::Text::new("Email for this profile:")
+        .prompt()
+        .context("Prompt cancelled")?;
+    let plan = "max".to_string();
+    let (account_id, display_name, org_name, org_uuid): (Option<String>, Option<String>, Option<String>, Option<String>) =
+        (None, None, None, None);
 
     let profile_id = claude_profile_id(&email, &plan);
 
