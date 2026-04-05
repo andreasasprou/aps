@@ -639,7 +639,7 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
         sections.push((current_section_title, current_section_rows));
     }
 
-    // Render each section: sort rows by weekly remaining DESC, then print
+    // Render each section: sort rows by weekly remaining DESC, then print via comfy-table
     for (title, mut rows) in sections {
         if let Some(ref t) = title {
             println!();
@@ -649,12 +649,6 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                 _ => format!("  \u{2500}\u{2500}\u{2500} {}", t.bold()),
             };
             println!("{}", styled_title);
-            if !rows.is_empty() {
-                println!("  {}",
-                    format!("{:>3} {:>5}  {:<13} {:<20} {:<17} {:<13}",
-                        "", "", "", "", "weekly", "5 hour").dimmed()
-                );
-            }
         }
 
         // Sort by weekly remaining DESC (errors/unknown go to bottom)
@@ -664,14 +658,20 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
             b_pct.cmp(&a_pct) // descending
         });
 
-        // Add blank line before rows
+        // Add blank line before rows when no section headers
         if !rows.is_empty() && !has_sections {
             println!();
         }
 
-        for row in &rows {
-            let dashboard_row = build_dashboard_row(&row.display, &row.result);
-            ui::render_dashboard_row(&dashboard_row);
+        // Collect DashboardRow structs and render via table
+        let dashboard_rows: Vec<ui::DashboardRow> = rows
+            .iter()
+            .map(|row| build_dashboard_row(&row.display, &row.result))
+            .collect();
+
+        if !dashboard_rows.is_empty() {
+            let table_str = ui::build_status_table(&dashboard_rows);
+            println!("{}", table_str);
         }
     }
 

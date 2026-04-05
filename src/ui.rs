@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 use colored::Colorize;
+use comfy_table::presets;
+use comfy_table::{Cell, ContentArrangement, Table};
 
 pub fn print_error(msg: &str) {
     eprintln!("{} {}", "[ERROR]".red().bold(), msg);
@@ -359,4 +361,157 @@ pub fn render_dashboard_row(row: &DashboardRow) {
     } else {
         println!("{}", line);
     }
+}
+
+/// Build a comfy_table::Table from a slice of DashboardRow structs.
+/// Returns the rendered table as a String (caller prints it).
+pub fn build_status_table(rows: &[DashboardRow]) -> String {
+    let mut table = Table::new();
+    table
+        .load_preset(presets::NOTHING)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+
+    // Column header row
+    table.add_row(vec![
+        Cell::new(""),                                               // glyph
+        Cell::new(""),                                               // plan badge
+        Cell::new(""),                                               // name
+        Cell::new(""),                                               // email
+        Cell::new(format!("{}", "weekly".dimmed())),                  // weekly bar+pct
+        Cell::new(format!("{}", "5 hour".dimmed())),                 // 5h bar+pct
+        Cell::new(""),                                               // suffixes
+    ]);
+
+    for row in rows {
+        let weekly_pct = row.weekly_remaining_pct.unwrap_or(0);
+        let tier = UsageTier::from_remaining_pct(weekly_pct);
+        let depleted = weekly_pct == 0 && row.error.is_empty();
+
+        // 1. Glyph
+        let glyph = tier.glyph();
+
+        // 2. Plan badge
+        let plan_text = format!(" {} ", row.plan.to_uppercase());
+        let plan_badge = match row.tool.as_str() {
+            "claude" => plan_text.on_truecolor(217, 119, 87).white().bold().to_string(),
+            _ => plan_text.on_yellow().black().bold().to_string(),
+        };
+
+        // 3. Name
+        let display_name = if !row.label.is_empty() {
+            row.label.clone()
+        } else {
+            row.email.split('@').next().unwrap_or(&row.email).to_string()
+        };
+
+        // 4. Email
+        let email_display = row.email.dimmed().to_string();
+
+        // Handle error rows — put error in suffix column to avoid stretching bar columns
+        if !row.error.is_empty() {
+            // Truncate long error messages for cleaner display
+            let err_short = if row.error.len() > 50 {
+                format!("{}...", &row.error[..47])
+            } else {
+                row.error.clone()
+            };
+            if depleted {
+                table.add_row(vec![
+                    Cell::new(format!("{}", glyph.dimmed())),
+                    Cell::new(format!("{}", plan_badge.dimmed())),
+                    Cell::new(format!("{}", display_name.dimmed())),
+                    Cell::new(format!("{}", row.email.dimmed())),
+                    Cell::new(""),
+                    Cell::new(""),
+                    Cell::new(format!("{}", err_short.red().dimmed())),
+                ]);
+            } else {
+                table.add_row(vec![
+                    Cell::new(&glyph),
+                    Cell::new(&plan_badge),
+                    Cell::new(&display_name),
+                    Cell::new(&email_display),
+                    Cell::new(""),
+                    Cell::new(""),
+                    Cell::new(format!("{}", err_short.red())),
+                ]);
+            }
+            continue;
+        }
+
+        // 5. Weekly bar
+        let weekly_bar_cell = {
+            let bar = build_bar(weekly_pct, 12, Some(tier));
+            let pct_str = format!("{:>3}%", weekly_pct);
+            format!("{} {}", bar, tier.color_str(&pct_str))
+        };
+
+        // 6. 5h bar
+        let five_hour_pct = row.five_hour_remaining_pct.unwrap_or(100);
+        let five_hour_bar_cell = {
+            let bar = build_bar(five_hour_pct, 8, None);
+            let pct_str = format!("{:>3}%", five_hour_pct);
+            format!("{} {}", bar, pct_str.dimmed())
+        };
+
+        // 7. Suffixes
+        let mut suffixes: Vec<String> = Vec::new();
+        if !row.weekly_reset.is_empty() {
+            suffixes.push(format!("resets {}", row.weekly_reset).dimmed().to_string());
+        }
+        if row.is_active {
+            let marker = match row.tool.as_str() {
+                "claude" => "<- active".truecolor(217, 119, 87).bold().to_string(),
+                _ => "<- active".yellow().bold().to_string(),
+            };
+            suffixes.push(marker);
+        }
+        if !row.extra_credits.is_empty() {
+            suffixes.push(row.extra_credits.dimmed().to_string());
+        }
+        if !row.cache_suffix.is_empty() {
+            suffixes.push(row.cache_suffix.dimmed().to_string());
+        }
+        let suffix_str = suffixes.join("  ");
+
+        if depleted {
+            // Fully dimmed row
+            let dim_weekly = format!(
+                "{} {:>3}%",
+                "\u{2591}".repeat(12),
+                0
+            );
+            let dim_5h = format!(
+                "{} {:>3}%",
+                "\u{2591}".repeat(8),
+                five_hour_pct
+            );
+            let dim_suffix = if !row.weekly_reset.is_empty() {
+                format!("resets {}", row.weekly_reset)
+            } else {
+                String::new()
+            };
+            table.add_row(vec![
+                Cell::new(format!("{}", "\u{25CB}".dimmed())),
+                Cell::new(format!("{}", format!(" {} ", row.plan.to_uppercase()).dimmed())),
+                Cell::new(format!("{}", display_name.dimmed())),
+                Cell::new(format!("{}", row.email.dimmed())),
+                Cell::new(format!("{}", dim_weekly.dimmed())),
+                Cell::new(format!("{}", dim_5h.dimmed())),
+                Cell::new(format!("{}", dim_suffix.dimmed())),
+            ]);
+        } else {
+            table.add_row(vec![
+                Cell::new(&glyph),
+                Cell::new(&plan_badge),
+                Cell::new(&display_name),
+                Cell::new(&email_display),
+                Cell::new(&weekly_bar_cell),
+                Cell::new(&five_hour_bar_cell),
+                Cell::new(&suffix_str),
+            ]);
+        }
+    }
+
+    table.to_string()
 }

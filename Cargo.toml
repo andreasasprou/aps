@@ -24,3 +24,4 @@ sha2 = "0.10"
 rand = "0.8"
 tiny_http = "0.12"
 open = "5"
+comfy-table = { version = "=7.1.1", features = ["custom_styling"] }
