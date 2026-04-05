@@ -243,19 +243,23 @@ pub fn render_dashboard_row(row: &DashboardRow) {
         format!("{:<20}", row.email)
     };
 
-    // 5. Weekly bar (12 chars wide) — hero metric
+    // 5. Weekly bar (12 chars wide) — hero metric, with percentage
     let weekly_bar = if row.error.is_empty() {
-        build_bar(weekly_pct, 12, Some(tier))
+        let bar = build_bar(weekly_pct, 12, Some(tier));
+        let pct_str = format!("{:>3}%", weekly_pct);
+        format!("{} {}", bar, tier.color_str(&pct_str))
     } else {
-        " ".repeat(12)
+        " ".repeat(17) // 12 bar + 1 space + 4 pct
     };
 
-    // 6. 5h bar (8 chars wide) — neutral slate
+    // 6. 5h bar (8 chars wide) — neutral slate, with percentage
     let five_hour_pct = row.five_hour_remaining_pct.unwrap_or(100);
     let five_hour_bar = if row.error.is_empty() {
-        build_bar(five_hour_pct, 8, None)
+        let bar = build_bar(five_hour_pct, 8, None);
+        let pct_str = format!("{:>3}%", five_hour_pct);
+        format!("{} {}", bar, pct_str.dimmed())
     } else {
-        " ".repeat(8)
+        " ".repeat(13) // 8 bar + 1 space + 4 pct
     };
 
     // 7. Reset time
@@ -341,13 +345,14 @@ pub fn render_dashboard_row(row: &DashboardRow) {
     if depleted {
         // Print entire line dimmed — we rebuild without ANSI colors
         let line_plain = format!(
-            "  {}  {}  {}  {} {} {}{}",
+            "  {}  {}  {}  {} {:>3}%  {} {:>3}%{}",
             "\u{25CB}",
             format!(" {} ", row.plan.to_uppercase()),
             name_padded,
             email_display,
-            "\u{2591}".repeat(12),
-            build_bar(five_hour_pct, 8, None),
+            format!("{} {}", "\u{2591}".repeat(12), 0),
+            format!("{}", "\u{2591}".repeat(8)),
+            five_hour_pct,
             if suffixes.is_empty() { String::new() } else { format!("  {}", row.weekly_reset) },
         );
         println!("{}", line_plain.dimmed());

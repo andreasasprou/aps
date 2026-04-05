@@ -651,7 +651,7 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
             println!("{}", styled_title);
             if !rows.is_empty() {
                 println!("  {}",
-                    format!("{:>3} {:>5}  {:<13} {:<20} {:<12} {:<8}",
+                    format!("{:>3} {:>5}  {:<13} {:<20} {:<17} {:<13}",
                         "", "", "", "", "weekly", "5 hour").dimmed()
                 );
             }
