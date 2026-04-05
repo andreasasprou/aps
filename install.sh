@@ -2,7 +2,7 @@
 set -e
 
 REPO="andreasasprou/aps"
-INSTALL_DIR="${APS_INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${APS_INSTALL_DIR:-$HOME/.local/bin}"
 
 # Detect OS and architecture
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -50,17 +50,54 @@ curl -fsSL "$URL" -o "$TMPDIR/aps.tar.gz"
 tar xzf "$TMPDIR/aps.tar.gz" -C "$TMPDIR"
 
 # Install binary
-if [ -w "$INSTALL_DIR" ]; then
-  mv "$TMPDIR/aps" "$INSTALL_DIR/aps"
-else
-  echo "Installing to $INSTALL_DIR (requires sudo)..."
-  sudo mv "$TMPDIR/aps" "$INSTALL_DIR/aps"
-fi
-
+mkdir -p "$INSTALL_DIR"
+mv "$TMPDIR/aps" "$INSTALL_DIR/aps"
 chmod +x "$INSTALL_DIR/aps"
 
 echo ""
 echo "✓ aps $LATEST installed to $INSTALL_DIR/aps"
+
+# Add to PATH in shell RC if not already there
+SHELL_RC=""
+case "${SHELL:-}" in
+  */zsh)  SHELL_RC="$HOME/.zshrc" ;;
+  */bash) SHELL_RC="$HOME/.bashrc" ;;
+esac
+
+# Fallback: check which RC file exists
+if [ -z "$SHELL_RC" ]; then
+  if [ -f "$HOME/.zshrc" ]; then
+    SHELL_RC="$HOME/.zshrc"
+  elif [ -f "$HOME/.bashrc" ]; then
+    SHELL_RC="$HOME/.bashrc"
+  fi
+fi
+
+PATH_LINE="export PATH=\"$INSTALL_DIR:\$PATH\""
+
+case ":$PATH:" in
+  *":$INSTALL_DIR:"*)
+    # Already in PATH, nothing to do
+    ;;
+  *)
+    if [ -n "$SHELL_RC" ]; then
+      # Check if already added to RC file
+      if ! grep -qF "$INSTALL_DIR" "$SHELL_RC" 2>/dev/null; then
+        echo "" >> "$SHELL_RC"
+        echo "# aps - agent profile switcher" >> "$SHELL_RC"
+        echo "$PATH_LINE" >> "$SHELL_RC"
+        echo "✓ Added $INSTALL_DIR to PATH in $SHELL_RC"
+      fi
+      # Source it so it works immediately in this session
+      export PATH="$INSTALL_DIR:$PATH"
+    else
+      echo ""
+      echo "Add to your PATH manually:"
+      echo "  $PATH_LINE"
+    fi
+    ;;
+esac
+
 echo ""
 echo "Get started:"
 echo "  aps auth claude --label myaccount    # Authenticate Claude account"
