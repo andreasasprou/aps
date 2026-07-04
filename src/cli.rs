@@ -87,6 +87,9 @@ pub enum AuthCommands {
         /// Optional label for the saved profile
         #[arg(long, short)]
         label: Option<String>,
+        /// Paste authorization code manually (for headless/SSH machines)
+        #[arg(long)]
+        manual: bool,
     },
     /// Authenticate with Codex via OAuth PKCE (opens browser)
     Codex {

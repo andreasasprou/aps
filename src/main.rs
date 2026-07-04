@@ -1,13 +1,13 @@
+mod auth;
 mod cli;
 mod common;
 mod costs;
 mod profiles;
-mod auth;
 mod ui;
 mod usage;
 
 use clap::Parser;
-use cli::{Cli, Commands, LabelCommands, AuthCommands};
+use cli::{AuthCommands, Cli, Commands, LabelCommands};
 
 fn main() {
     let cli = Cli::parse();
@@ -18,9 +18,17 @@ fn main() {
     }
 
     let result = match cli.command {
-        Commands::Save { tool, from_token, from_refresh_token, label } => {
-            profiles::save(&tool, from_token.as_deref(), from_refresh_token.as_deref(), label.as_deref())
-        }
+        Commands::Save {
+            tool,
+            from_token,
+            from_refresh_token,
+            label,
+        } => profiles::save(
+            &tool,
+            from_token.as_deref(),
+            from_refresh_token.as_deref(),
+            label.as_deref(),
+        ),
         Commands::Load { tool } => profiles::load(&tool),
         Commands::List { tool } => profiles::list(tool.as_deref()),
         Commands::Current { tool } => profiles::current(tool.as_deref()),
@@ -34,7 +42,7 @@ fn main() {
         Commands::Costs => costs::costs(),
         Commands::Doctor => profiles::doctor(),
         Commands::Auth { command } => match command {
-            AuthCommands::Claude { label } => auth::oauth_claude(label.as_deref()),
+            AuthCommands::Claude { label, manual } => auth::oauth_claude(label.as_deref(), manual),
             AuthCommands::Codex { label } => auth::oauth_codex(label.as_deref()),
         },
     };

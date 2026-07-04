@@ -38,6 +38,8 @@ pub struct ProfileMeta {
     pub org_uuid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_failed_at: Option<String>,
 }
 
 impl ProfileIndex {
@@ -88,7 +90,12 @@ fn codex_profile_id(email: &str, plan: &str) -> String {
 
 // ─── Commands ───
 
-pub fn save(tool: &str, from_token: Option<&str>, from_refresh_token: Option<&str>, label_override: Option<&str>) -> Result<()> {
+pub fn save(
+    tool: &str,
+    from_token: Option<&str>,
+    from_refresh_token: Option<&str>,
+    label_override: Option<&str>,
+) -> Result<()> {
     let tool = common::validate_tool(tool)?;
 
     match tool {
@@ -210,14 +217,13 @@ fn save_claude(label_override: Option<&str>) -> Result<()> {
                 org_name: org_name.clone(),
                 org_uuid,
                 rate_limit_tier,
+                refresh_failed_at: None,
             },
         );
         save_index("claude", &index)?;
         let _ = write_stored_active_profile("claude", &profile_id);
 
-        let org_display = org_name
-            .map(|o| format!(" ({})", o))
-            .unwrap_or_default();
+        let org_display = org_name.map(|o| format!(" ({})", o)).unwrap_or_default();
         ui::print_success(&format!(
             "✅ Saved Claude profile: {} ({}){}",
             profile_id, email, org_display
@@ -230,13 +236,20 @@ fn save_claude(label_override: Option<&str>) -> Result<()> {
 fn save_claude_from_token(access_token: &str, label_override: Option<&str>) -> Result<()> {
     // Setup tokens only have user:inference scope — can't call account API.
     // Prompt for email directly.
-    println!("{}", "Setup tokens are inference-only — enter account details:".dimmed());
+    println!(
+        "{}",
+        "Setup tokens are inference-only — enter account details:".dimmed()
+    );
     let email = inquire::Text::new("Email for this profile:")
         .prompt()
         .context("Prompt cancelled")?;
     let plan = "max".to_string();
-    let (account_id, display_name, org_name, org_uuid): (Option<String>, Option<String>, Option<String>, Option<String>) =
-        (None, None, None, None);
+    let (account_id, display_name, org_name, org_uuid): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = (None, None, None, None);
 
     let profile_id = claude_profile_id(&email, &plan);
 
@@ -297,6 +310,7 @@ fn save_claude_from_token(access_token: &str, label_override: Option<&str>) -> R
                 org_name: org_name.clone(),
                 org_uuid,
                 rate_limit_tier: None,
+                refresh_failed_at: None,
             },
         );
         save_index("claude", &index)?;
@@ -339,7 +353,10 @@ fn save_claude_from_refresh_token(refresh_token: &str, label_override: Option<&s
             }
             Err(e) => {
                 println!("{}", "failed".yellow());
-                ui::print_warning(&format!("Could not fetch account info: {}. Enter manually.", e));
+                ui::print_warning(&format!(
+                    "Could not fetch account info: {}. Enter manually.",
+                    e
+                ));
                 let email = inquire::Text::new("Email for this profile:")
                     .prompt()
                     .context("Prompt cancelled")?;
@@ -348,10 +365,12 @@ fn save_claude_from_refresh_token(refresh_token: &str, label_override: Option<&s
         };
 
     let profile_id = claude_profile_id(&email, &plan);
-    let new_refresh_token = refreshed.refresh_token.unwrap_or_else(|| refresh_token.to_string());
-    let expires_at = refreshed.expires_in.map(|secs| {
-        chrono::Utc::now().timestamp_millis() as f64 + (secs as f64 * 1000.0)
-    });
+    let new_refresh_token = refreshed
+        .refresh_token
+        .unwrap_or_else(|| refresh_token.to_string());
+    let expires_at = refreshed
+        .expires_in
+        .map(|secs| chrono::Utc::now().timestamp_millis() as f64 + (secs as f64 * 1000.0));
 
     let creds = auth::ClaudeCredentialsFile {
         claude_ai_oauth: Some(auth::ClaudeOAuth {
@@ -410,6 +429,7 @@ fn save_claude_from_refresh_token(refresh_token: &str, label_override: Option<&s
                 org_name: org_name.clone(),
                 org_uuid,
                 rate_limit_tier,
+                refresh_failed_at: None,
             },
         );
         save_index("claude", &index)?;
@@ -481,6 +501,7 @@ fn save_codex(label_override: Option<&str>) -> Result<()> {
                 org_name: None,
                 org_uuid: None,
                 rate_limit_tier: None,
+                refresh_failed_at: None,
             },
         );
         save_index("codex", &index)?;
@@ -540,12 +561,49 @@ pub fn load(tool: &str) -> Result<()> {
         let data = fs::read(&profile_path)
             .context(format!("Failed to read profile file: {}", profile_id))?;
 
-        // Track active profile for reliable detection
-        let _ = write_stored_active_profile(tool, profile_id);
-
         match tool {
             "claude" => {
-                let creds: auth::ClaudeCredentialsFile = serde_json::from_slice(&data)?;
+                if let Err(e) = sync_back_claude_live_credentials(profile_id) {
+                    ui::print_warning(&format!("Could not sync back live credentials: {}", e));
+                }
+
+                let mut creds: auth::ClaudeCredentialsFile = serde_json::from_slice(&data)?;
+
+                if auth::is_claude_token_expired(&creds) {
+                    if let Some(rt) = creds
+                        .claude_ai_oauth
+                        .as_ref()
+                        .and_then(|o| o.refresh_token.clone())
+                    {
+                        match auth::refresh_claude_token(&rt) {
+                            Ok(refreshed) => {
+                                if let Some(ref mut oauth) = creds.claude_ai_oauth {
+                                    oauth.access_token = Some(refreshed.access_token.clone());
+                                    if let Some(ref new_rt) = refreshed.refresh_token {
+                                        oauth.refresh_token = Some(new_rt.clone());
+                                    }
+                                    if let Some(expires_in) = refreshed.expires_in {
+                                        oauth.expires_at = Some(
+                                            chrono::Utc::now().timestamp_millis() as f64
+                                                + (expires_in as f64 * 1000.0),
+                                        );
+                                    }
+                                }
+                                let data = serde_json::to_vec_pretty(&creds)?;
+                                common::atomic_write(&profile_path, &data)?;
+                            }
+                            Err(e) => {
+                                ui::print_warning(&format!(
+                                    "Could not refresh expired token: {}. Loading stale credentials.",
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // Track active profile for reliable detection
+                let _ = write_stored_active_profile(tool, profile_id);
 
                 // Write credentials file (with file locking)
                 auth::write_claude_credentials(&creds)?;
@@ -561,33 +619,20 @@ pub fn load(tool: &str) -> Result<()> {
                             .map(|s| s.join(","))
                             .unwrap_or_else(|| auth::claude_default_scopes().join(","));
                         println!();
-                        println!(
-                            "{}",
-                            "For instant switching in new shells, run:".dimmed()
-                        );
-                        println!(
-                            "  export CLAUDE_CODE_OAUTH_REFRESH_TOKEN={}",
-                            rt
-                        );
-                        println!(
-                            "  export CLAUDE_CODE_OAUTH_SCOPES={}",
-                            scopes
-                        );
+                        println!("{}", "For instant switching in new shells, run:".dimmed());
+                        println!("  export CLAUDE_CODE_OAUTH_REFRESH_TOKEN={}", rt);
+                        println!("  export CLAUDE_CODE_OAUTH_SCOPES={}", scopes);
                     } else if let Some(ref token) = oauth.access_token {
                         // Setup token profile — show access token hint
                         println!();
-                        println!(
-                            "{}",
-                            "For instant switching in new shells, run:".dimmed()
-                        );
-                        println!(
-                            "  export CLAUDE_CODE_OAUTH_TOKEN={}",
-                            token
-                        );
+                        println!("{}", "For instant switching in new shells, run:".dimmed());
+                        println!("  export CLAUDE_CODE_OAUTH_TOKEN={}", token);
                     }
                 }
             }
             "codex" => {
+                let _ = write_stored_active_profile(tool, profile_id);
+
                 let auth_data: auth::CodexAuthFile = serde_json::from_slice(&data)?;
                 auth::write_codex_auth(&auth_data)?;
                 ui::print_success(&format!("✅ Loaded Codex profile: {}", profile_id));
@@ -621,7 +666,15 @@ pub fn list(tool_filter: Option<&str>) -> Result<()> {
         for (id, meta) in &index.profiles {
             let is_active = Some(id.as_str()) == active_id.as_deref();
             let label = meta.label.as_deref().unwrap_or("");
-            ui::render_profile_header_with_tool(tool, &meta.plan, &meta.email, label, is_active);
+            let refresh_dead = tool == "claude" && meta.refresh_failed_at.is_some();
+            ui::render_profile_header_with_tool(
+                tool,
+                &meta.plan,
+                &meta.email,
+                label,
+                is_active,
+                refresh_dead,
+            );
         }
     }
 
@@ -708,13 +761,10 @@ pub fn delete(tool: &str) -> Result<()> {
             return Ok(());
         }
 
-        let confirm = inquire::Confirm::new(&format!(
-            "Delete {} profile(s)?",
-            selections.len()
-        ))
-        .with_default(false)
-        .prompt()
-        .unwrap_or(false);
+        let confirm = inquire::Confirm::new(&format!("Delete {} profile(s)?", selections.len()))
+            .with_default(false)
+            .prompt()
+            .unwrap_or(false);
 
         if !confirm {
             println!("{}", "Delete cancelled.".dimmed());
@@ -832,7 +882,10 @@ pub fn doctor() -> Result<()> {
                     println!("    Email: {}", identity.email.dimmed());
                     println!("    Plan: {}", identity.plan.dimmed());
                 }
-                Err(e) => println!("    {}", format!("⚠️  Could not extract identity: {}", e).yellow()),
+                Err(e) => println!(
+                    "    {}",
+                    format!("⚠️  Could not extract identity: {}", e).yellow()
+                ),
             }
         }
         Ok(None) => println!("{}", "❌ Not found".red()),
@@ -873,10 +926,112 @@ pub fn doctor() -> Result<()> {
 
 // ─── Helpers ───
 
+/// If switching away from profile Y, capture live credential rotations back into Y's blob.
+fn sync_back_claude_live_credentials(new_profile_id: &str) -> Result<()> {
+    let old_id = match read_stored_active_profile("claude") {
+        Some(id) if id != new_profile_id => id,
+        _ => return Ok(()),
+    };
+
+    let profile_path = common::profiles_dir("claude")?.join(&old_id);
+    if !profile_path.exists() {
+        return Ok(());
+    }
+
+    let y_data = fs::read_to_string(&profile_path)?;
+    let y_creds: auth::ClaudeCredentialsFile = serde_json::from_str(&y_data)?;
+
+    let live = match auth::read_claude_credentials()? {
+        Some(creds) => creds,
+        None => return Ok(()),
+    };
+
+    let (Some(live_oauth), Some(y_oauth)) = (
+        live.claude_ai_oauth.as_ref(),
+        y_creds.claude_ai_oauth.as_ref(),
+    ) else {
+        return Ok(());
+    };
+
+    let access_match = live_oauth
+        .access_token
+        .as_ref()
+        .is_some_and(|t| y_oauth.access_token.as_ref() == Some(t));
+    let refresh_match = live_oauth
+        .refresh_token
+        .as_ref()
+        .is_some_and(|t| y_oauth.refresh_token.as_ref() == Some(t));
+
+    if !access_match && !refresh_match {
+        let live_access = match live_oauth.access_token.as_deref() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let index = load_index("claude")?;
+        let y_meta = match index.profiles.get(&old_id) {
+            Some(meta) => meta,
+            None => return Ok(()),
+        };
+        if let Ok(info) = auth::fetch_claude_account_info(live_access) {
+            match info.email_address.as_deref() {
+                Some(fe) if !fe.is_empty() && fe == y_meta.email.as_str() => {}
+                _ => return Ok(()),
+            }
+        } else if let Some(refresh_token) = live_oauth.refresh_token.as_deref() {
+            let mut live_copy = live.clone();
+            let refreshed = match auth::refresh_claude_token(refresh_token) {
+                Ok(r) => r,
+                Err(_) => return Ok(()),
+            };
+            if let Some(ref mut oauth) = live_copy.claude_ai_oauth {
+                auth::apply_claude_token_refresh(oauth, &refreshed);
+            }
+            let new_access = match live_copy
+                .claude_ai_oauth
+                .as_ref()
+                .and_then(|o| o.access_token.as_deref())
+            {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+            let info = match auth::fetch_claude_account_info(new_access) {
+                Ok(i) => i,
+                Err(_) => return Ok(()),
+            };
+            match info.email_address.as_deref() {
+                Some(fe) if !fe.is_empty() && fe == y_meta.email.as_str() => {}
+                _ => return Ok(()),
+            }
+            let live_norm = serde_json::to_vec(&live_copy)?;
+            let y_norm = serde_json::to_vec(&y_creds)?;
+            if live_norm == y_norm {
+                return Ok(());
+            }
+            let data = serde_json::to_vec_pretty(&live_copy)?;
+            common::atomic_write(&profile_path, &data)?;
+            return Ok(());
+        } else {
+            return Ok(());
+        }
+    }
+
+    let live_norm = serde_json::to_vec(&live)?;
+    let y_norm = serde_json::to_vec(&y_creds)?;
+    if live_norm == y_norm {
+        return Ok(());
+    }
+
+    let data = serde_json::to_vec_pretty(&live)?;
+    common::atomic_write(&profile_path, &data)
+}
+
 /// Read the stored active profile ID (written on `aps load`)
 fn read_stored_active_profile(tool: &str) -> Option<String> {
     let path = common::active_profile_path(tool).ok()?;
-    fs::read_to_string(&path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Write the active profile ID to disk
@@ -913,7 +1068,9 @@ fn get_active_profile_id(tool: &str) -> Result<Option<String>> {
             for id in index.profiles.keys() {
                 let profile_path = common::profiles_dir(tool)?.join(id);
                 if let Ok(data) = fs::read_to_string(&profile_path) {
-                    if let Ok(saved_creds) = serde_json::from_str::<auth::ClaudeCredentialsFile>(&data) {
+                    if let Ok(saved_creds) =
+                        serde_json::from_str::<auth::ClaudeCredentialsFile>(&data)
+                    {
                         if let Some(saved_token) = auth::claude_access_token(&saved_creds) {
                             if saved_token == current_token {
                                 let _ = write_stored_active_profile("claude", id);
@@ -927,9 +1084,7 @@ fn get_active_profile_id(tool: &str) -> Result<Option<String>> {
                                 .claude_ai_oauth
                                 .as_ref()
                                 .and_then(|o| o.refresh_token.as_ref());
-                            if saved_refresh.is_some()
-                                && saved_refresh == current_refresh
-                            {
+                            if saved_refresh.is_some() && saved_refresh == current_refresh {
                                 let _ = write_stored_active_profile("claude", id);
                                 return Ok(Some(id.clone()));
                             }
@@ -958,10 +1113,7 @@ fn get_active_profile_id(tool: &str) -> Result<Option<String>> {
                 return Ok(None);
             }
             let auth_data = auth_data.unwrap();
-            let current_account_id = auth_data
-                .tokens
-                .as_ref()
-                .and_then(|t| t.account_id.clone());
+            let current_account_id = auth_data.tokens.as_ref().and_then(|t| t.account_id.clone());
 
             if let Some(ref current_id) = current_account_id {
                 for (id, meta) in &index.profiles {
@@ -1057,6 +1209,7 @@ pub fn save_claude_oauth_profile(
                 org_name: org_name.clone(),
                 org_uuid,
                 rate_limit_tier,
+                refresh_failed_at: None,
             },
         );
         save_index("claude", &index)?;
@@ -1067,6 +1220,21 @@ pub fn save_claude_oauth_profile(
             "Saved Claude profile (OAuth): {} ({}){}",
             profile_id, email, org_display
         ));
+        Ok(())
+    })
+}
+
+pub fn set_claude_refresh_failed(profile_id: &str, failed: bool) -> Result<()> {
+    with_lock("claude", || {
+        let mut index = load_index("claude")?;
+        if let Some(meta) = index.profiles.get_mut(profile_id) {
+            meta.refresh_failed_at = if failed {
+                Some(chrono::Utc::now().to_rfc3339())
+            } else {
+                None
+            };
+            save_index("claude", &index)?;
+        }
         Ok(())
     })
 }
@@ -1125,6 +1293,7 @@ pub fn save_codex_oauth_profile(
                 org_name: None,
                 org_uuid: None,
                 rate_limit_tier: None,
+                refresh_failed_at: None,
             },
         );
         save_index("codex", &index)?;

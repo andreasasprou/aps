@@ -45,16 +45,20 @@ pub fn read_claude_credentials_file() -> Result<Option<ClaudeCredentialsFile>> {
 #[cfg(target_os = "macos")]
 pub fn read_claude_keychain() -> Result<Option<ClaudeCredentialsFile>> {
     let output = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
         .output();
 
     match output {
         Ok(out) if out.status.success() => {
-            let json_str = String::from_utf8(out.stdout)
-                .context("Keychain data is not valid UTF-8")?;
-            let creds: ClaudeCredentialsFile =
-                serde_json::from_str(json_str.trim())
-                    .context("Failed to parse keychain credentials")?;
+            let json_str =
+                String::from_utf8(out.stdout).context("Keychain data is not valid UTF-8")?;
+            let creds: ClaudeCredentialsFile = serde_json::from_str(json_str.trim())
+                .context("Failed to parse keychain credentials")?;
             Ok(Some(creds))
         }
         _ => Ok(None),
@@ -79,9 +83,12 @@ pub fn write_claude_keychain(creds: &ClaudeCredentialsFile) -> Result<()> {
     let output = std::process::Command::new("security")
         .args([
             "add-generic-password",
-            "-s", "Claude Code-credentials",
-            "-a", "Claude Code-credentials",
-            "-w", &json_str,
+            "-s",
+            "Claude Code-credentials",
+            "-a",
+            "Claude Code-credentials",
+            "-w",
+            &json_str,
         ])
         .output()
         .context("Failed to run security command")?;
@@ -137,7 +144,8 @@ pub fn write_claude_credentials(creds: &ClaudeCredentialsFile) -> Result<()> {
     // Lock ~/.claude/ during writes to avoid races with Claude Code
     let lock_path = common::claude_lock_path()?;
     let mut lock = fslock::LockFile::open(&lock_path)?;
-    lock.lock().context("Failed to acquire Claude credential lock")?;
+    lock.lock()
+        .context("Failed to acquire Claude credential lock")?;
     let result = common::atomic_write(&path, data.as_bytes());
     lock.unlock().ok();
     result?;
@@ -188,8 +196,7 @@ pub fn read_codex_auth() -> Result<Option<CodexAuthFile>> {
         return Ok(None);
     }
     let data = fs::read_to_string(&path).context("Failed to read Codex auth file")?;
-    let auth: CodexAuthFile =
-        serde_json::from_str(&data).context("Failed to parse Codex auth")?;
+    let auth: CodexAuthFile = serde_json::from_str(&data).context("Failed to parse Codex auth")?;
     Ok(Some(auth))
 }
 
@@ -222,7 +229,11 @@ pub fn extract_codex_identity(auth: &CodexAuthFile) -> Result<CodexIdentity> {
 
     let email = claims
         .get("email")
-        .or_else(|| claims.get("https://api.openai.com/profile").and_then(|p| p.get("email")))
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/profile")
+                .and_then(|p| p.get("email"))
+        })
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
@@ -240,10 +251,7 @@ pub fn extract_codex_identity(auth: &CodexAuthFile) -> Result<CodexIdentity> {
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
 
-    let principal_id = claims
-        .get("sub")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let principal_id = claims.get("sub").and_then(|v| v.as_str()).map(String::from);
 
     let workspace_or_org_id = claims
         .get("https://api.openai.com/auth")
@@ -273,6 +281,8 @@ const CODEX_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 const CLAUDE_REFRESH_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const CLAUDE_MANUAL_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+const CLAUDE_MANUAL_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 pub fn refresh_codex_token(refresh_token: &str) -> Result<CodexTokenRefreshResponse> {
@@ -297,6 +307,40 @@ pub struct CodexTokenRefreshResponse {
     pub refresh_token: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct ClaudeRefreshError {
+    pub status: Option<u16>,
+    pub message: String,
+}
+
+impl std::fmt::Display for ClaudeRefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            Some(code) => write!(
+                f,
+                "Claude token refresh failed (HTTP {}): {}",
+                code, self.message
+            ),
+            None => write!(f, "Claude token refresh failed: {}", self.message),
+        }
+    }
+}
+
+impl std::error::Error for ClaudeRefreshError {}
+
+impl ClaudeRefreshError {
+    pub fn is_permanent(&self) -> bool {
+        match self.status {
+            Some(400 | 401) => true,
+            Some(403) => {
+                let msg = self.message.to_lowercase();
+                msg.contains("invalid") || msg.contains("revoked")
+            }
+            _ => false,
+        }
+    }
+}
+
 pub fn refresh_claude_token(refresh_token: &str) -> Result<ClaudeTokenRefreshResponse> {
     let scope = claude_default_scopes().join(" ");
     let body = serde_json::json!({
@@ -306,12 +350,23 @@ pub fn refresh_claude_token(refresh_token: &str) -> Result<ClaudeTokenRefreshRes
         "scope": scope
     });
 
-    let resp = ureq::post(CLAUDE_REFRESH_URL)
+    match ureq::post(CLAUDE_REFRESH_URL)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
-        .context("Failed to refresh Claude token")?;
-
-    resp.into_json().context("Failed to parse refresh response")
+    {
+        Ok(resp) => resp.into_json().context("Failed to parse refresh response"),
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            Err(anyhow::Error::new(ClaudeRefreshError {
+                status: Some(code),
+                message: body,
+            }))
+        }
+        Err(e) => Err(anyhow::Error::new(ClaudeRefreshError {
+            status: None,
+            message: e.to_string(),
+        })),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -339,8 +394,30 @@ pub fn serialize_codex_auth(auth: &CodexAuthFile) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec_pretty(auth)?)
 }
 
+pub(crate) fn apply_claude_token_refresh(
+    oauth: &mut ClaudeOAuth,
+    refreshed: &ClaudeTokenRefreshResponse,
+) {
+    oauth.access_token = Some(refreshed.access_token.clone());
+    if let Some(ref new_rt) = refreshed.refresh_token {
+        oauth.refresh_token = Some(new_rt.clone());
+    }
+    if let Some(expires_in) = refreshed.expires_in {
+        oauth.expires_at =
+            Some(chrono::Utc::now().timestamp_millis() as f64 + (expires_in as f64 * 1000.0));
+    }
+}
+
+fn read_stored_claude_active_profile() -> Option<String> {
+    let path = common::active_profile_path("claude").ok()?;
+    fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Update a saved Claude profile with refreshed tokens
-pub fn update_claude_profile_tokens(
+fn update_claude_profile_tokens(
     profile_id: &str,
     refreshed: &ClaudeTokenRefreshResponse,
 ) -> Result<()> {
@@ -353,19 +430,46 @@ pub fn update_claude_profile_tokens(
     let mut creds: ClaudeCredentialsFile = serde_json::from_str(&data)?;
 
     if let Some(ref mut oauth) = creds.claude_ai_oauth {
-        oauth.access_token = Some(refreshed.access_token.clone());
-        if let Some(ref new_rt) = refreshed.refresh_token {
-            oauth.refresh_token = Some(new_rt.clone());
-        }
-        if let Some(expires_in) = refreshed.expires_in {
-            oauth.expires_at = Some(
-                chrono::Utc::now().timestamp_millis() as f64 + (expires_in as f64 * 1000.0),
-            );
-        }
+        apply_claude_token_refresh(oauth, refreshed);
     }
 
     let data = serde_json::to_vec_pretty(&creds)?;
     common::atomic_write(&profile_path, &data)
+}
+
+/// Persist refreshed Claude tokens to the profile blob and live credentials when active
+pub fn persist_refreshed_claude_tokens(
+    profile_id: &str,
+    refreshed: &ClaudeTokenRefreshResponse,
+) -> Result<()> {
+    update_claude_profile_tokens(profile_id, refreshed)?;
+
+    if read_stored_claude_active_profile().as_deref() != Some(profile_id) {
+        return Ok(());
+    }
+
+    match read_claude_credentials() {
+        Ok(Some(mut live)) => {
+            if let Some(ref mut oauth) = live.claude_ai_oauth {
+                apply_claude_token_refresh(oauth, refreshed);
+                if let Err(e) = write_claude_credentials(&live) {
+                    crate::ui::print_warning(&format!(
+                        "Refreshed tokens saved to profile but could not update live credentials: {}",
+                        e
+                    ));
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            crate::ui::print_warning(&format!(
+                "Refreshed tokens saved to profile but could not read live credentials: {}",
+                e
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Update a saved Codex profile with refreshed tokens
@@ -406,7 +510,9 @@ pub fn fetch_claude_account_info(access_token: &str) -> Result<ClaudeAccountInfo
         .call()
         .context("Failed to fetch Claude account info")?;
 
-    let body: ClaudeAccountInfo = resp.into_json().context("Failed to parse Claude account info")?;
+    let body: ClaudeAccountInfo = resp
+        .into_json()
+        .context("Failed to parse Claude account info")?;
     Ok(body)
 }
 
@@ -457,6 +563,16 @@ fn generate_code_challenge(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
 }
 
+fn copy_to_clipboard_osc52(text: &str) -> Result<()> {
+    use std::io::Write;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    print!("\x1b]52;c;{}\x07", encoded);
+    std::io::stdout()
+        .flush()
+        .context("Failed to flush stdout")?;
+    Ok(())
+}
+
 fn start_callback_server() -> Result<tiny_http::Server> {
     // Try preferred port first, fall back to OS-assigned
     if let Ok(server) = tiny_http::Server::http("127.0.0.1:9876") {
@@ -475,16 +591,16 @@ fn wait_for_callback(server: tiny_http::Server) -> Result<(String, String)> {
             let url = request.url().to_string();
             // Send a nice HTML response back to the browser
             let response_body = "<html><body><h2>Authentication successful!</h2><p>You can close this tab and return to your terminal.</p></body></html>";
-            let response = tiny_http::Response::from_string(response_body)
-                .with_header(
-                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap(),
-                );
+            let response = tiny_http::Response::from_string(response_body).with_header(
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap(),
+            );
             let _ = request.respond(response);
             let _ = tx.send(url);
         }
     });
 
-    let url = rx.recv_timeout(std::time::Duration::from_secs(300))
+    let url = rx
+        .recv_timeout(std::time::Duration::from_secs(300))
         .context("Timed out waiting for OAuth callback (5 minutes)")?;
 
     // Parse query params from /callback?code=...&state=...
@@ -515,10 +631,12 @@ struct OAuthTokenResponse {
 }
 
 fn exchange_code_for_tokens(
+    token_url: &str,
     code: &str,
     code_verifier: &str,
     redirect_uri: &str,
     state: &str,
+    extra_header: Option<(&str, &str)>,
 ) -> Result<OAuthTokenResponse> {
     let body = serde_json::json!({
         "grant_type": "authorization_code",
@@ -529,10 +647,12 @@ fn exchange_code_for_tokens(
         "state": state,
     });
 
-    match ureq::post(CLAUDE_REFRESH_URL)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
-    {
+    let mut req = ureq::post(token_url).set("Content-Type", "application/json");
+    if let Some((name, value)) = extra_header {
+        req = req.set(name, value);
+    }
+
+    match req.send_string(&body.to_string()) {
         Ok(resp) => resp.into_json().context("Failed to parse token response"),
         Err(ureq::Error::Status(code, resp)) => {
             let body = resp.into_string().unwrap_or_default();
@@ -562,56 +682,9 @@ fn urldecode(s: &str) -> String {
     result
 }
 
-/// Full OAuth PKCE flow for Claude: opens browser, gets tokens, saves profile
-pub fn oauth_claude(label: Option<&str>) -> Result<()> {
+/// Save tokens and profile after a successful Claude OAuth exchange
+fn finish_claude_oauth(tokens: OAuthTokenResponse, label: Option<&str>) -> Result<()> {
     use colored::Colorize;
-
-    println!("{}", "Starting Claude OAuth authentication...".bold());
-    println!();
-
-    let code_verifier = generate_code_verifier();
-    let code_challenge = generate_code_challenge(&code_verifier);
-    let state = uuid::Uuid::new_v4().to_string();
-
-    // Start local callback server
-    let server = start_callback_server()?;
-    let port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(9876);
-    let redirect_uri = format!("http://localhost:{}/callback", port);
-
-    let scope = claude_default_scopes().join(" ");
-
-    // Build authorization URL
-    let auth_url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
-        "https://claude.com/cai/oauth/authorize",
-        CLAUDE_CLIENT_ID,
-        urlencod(&redirect_uri),
-        urlencod(&scope),
-        urlencod(&state),
-        urlencod(&code_challenge),
-    );
-
-    println!("Opening browser for authentication...");
-    println!();
-    if open::that(&auth_url).is_err() {
-        println!("{}", "Could not open browser automatically. Open this URL:".yellow());
-        println!("  {}", auth_url);
-    }
-    println!("{}", "Waiting for OAuth callback (up to 5 minutes)...".dimmed());
-
-    // Wait for the callback
-    let (code, returned_state) = wait_for_callback(server)?;
-
-    // Verify state
-    if returned_state != state {
-        anyhow::bail!("OAuth state mismatch — possible CSRF attack");
-    }
-
-    println!();
-    print!("{}", "Exchanging code for tokens... ".dimmed());
-
-    let tokens = exchange_code_for_tokens(&code, &code_verifier, &redirect_uri, &state)?;
-    println!("{}", "OK".green());
 
     // Fetch account info to get email + metadata
     print!("{}", "Fetching account info... ".dimmed());
@@ -636,7 +709,10 @@ pub fn oauth_claude(label: Option<&str>) -> Result<()> {
             }
             Err(e) => {
                 println!("{}", "failed".yellow());
-                crate::ui::print_warning(&format!("Could not fetch account info: {}. Enter manually.", e));
+                crate::ui::print_warning(&format!(
+                    "Could not fetch account info: {}. Enter manually.",
+                    e
+                ));
                 let email_input = inquire::Text::new("Email for this profile:")
                     .prompt()
                     .context("Prompt cancelled")?;
@@ -644,9 +720,9 @@ pub fn oauth_claude(label: Option<&str>) -> Result<()> {
             }
         };
 
-    let expires_at = tokens.expires_in.map(|secs| {
-        chrono::Utc::now().timestamp_millis() as f64 + (secs as f64 * 1000.0)
-    });
+    let expires_at = tokens
+        .expires_in
+        .map(|secs| chrono::Utc::now().timestamp_millis() as f64 + (secs as f64 * 1000.0));
 
     let refresh_token = tokens.refresh_token.unwrap_or_default();
 
@@ -680,6 +756,142 @@ pub fn oauth_claude(label: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Full OAuth PKCE flow for Claude: opens browser or manual paste, gets tokens, saves profile
+pub fn oauth_claude(label: Option<&str>, manual: bool) -> Result<()> {
+    use colored::Colorize;
+
+    println!("{}", "Starting Claude OAuth authentication...".bold());
+    println!();
+
+    let code_verifier = generate_code_verifier();
+    let code_challenge = generate_code_challenge(&code_verifier);
+    let state = uuid::Uuid::new_v4().to_string();
+    let scope = claude_default_scopes().join(" ");
+
+    if manual {
+        let auth_url = format!(
+            "https://claude.ai/oauth/authorize?code=true&client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}",
+            CLAUDE_CLIENT_ID,
+            urlencod(CLAUDE_MANUAL_REDIRECT_URI),
+            urlencod(&scope),
+            urlencod(&code_challenge),
+            urlencod(&state),
+        );
+
+        println!("Open this URL in a browser to authenticate:");
+        println!("  {}", auth_url);
+        println!("{}", "(press c at the prompt to copy the URL)".dimmed());
+        println!();
+
+        let pasted = loop {
+            let input = inquire::Text::new("Paste the authorization code (or c to copy the URL):")
+                .prompt()
+                .context("Prompt cancelled")?;
+            let trimmed = input.trim();
+            if trimmed.eq_ignore_ascii_case("c") || trimmed.eq_ignore_ascii_case("copy") {
+                copy_to_clipboard_osc52(&auth_url)?;
+                println!(
+                    "{}",
+                    "URL copied to clipboard (OSC 52 — works in most terminals; inside tmux needs set-clipboard on)."
+                        .dimmed()
+                );
+                continue;
+            }
+            break input;
+        };
+
+        let mut parts = pasted.trim().splitn(2, '#');
+        let code = parts
+            .next()
+            .context("No authorization code in pasted value")?
+            .trim();
+        if let Some(returned_state) = parts.next() {
+            if returned_state.trim() != state {
+                anyhow::bail!("OAuth state mismatch — possible CSRF attack");
+            }
+        }
+
+        println!();
+        print!("{}", "Exchanging code for tokens... ".dimmed());
+
+        let tokens = exchange_code_for_tokens(
+            CLAUDE_MANUAL_TOKEN_URL,
+            code,
+            &code_verifier,
+            CLAUDE_MANUAL_REDIRECT_URI,
+            &state,
+            Some(("anthropic-beta", "oauth-2025-04-20")),
+        )?;
+        println!("{}", "OK".green());
+
+        finish_claude_oauth(tokens, label)?;
+        return Ok(());
+    }
+
+    // Start local callback server
+    let server = start_callback_server()?;
+    let port = server
+        .server_addr()
+        .to_ip()
+        .map(|a| a.port())
+        .unwrap_or(9876);
+    let redirect_uri = format!("http://localhost:{}/callback", port);
+
+    // Build authorization URL
+    let auth_url = format!(
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        "https://claude.com/cai/oauth/authorize",
+        CLAUDE_CLIENT_ID,
+        urlencod(&redirect_uri),
+        urlencod(&scope),
+        urlencod(&state),
+        urlencod(&code_challenge),
+    );
+
+    println!("Opening browser for authentication...");
+    println!();
+    if open::that(&auth_url).is_err() {
+        println!(
+            "{}",
+            "Could not open browser automatically. Open this URL:".yellow()
+        );
+        println!("  {}", auth_url);
+        println!(
+            "{}",
+            "Or rerun with --manual on headless machines.".dimmed()
+        );
+    }
+    println!(
+        "{}",
+        "Waiting for OAuth callback (up to 5 minutes)...".dimmed()
+    );
+
+    // Wait for the callback
+    let (code, returned_state) = wait_for_callback(server)?;
+
+    // Verify state
+    if returned_state != state {
+        anyhow::bail!("OAuth state mismatch — possible CSRF attack");
+    }
+
+    println!();
+    print!("{}", "Exchanging code for tokens... ".dimmed());
+
+    let tokens = exchange_code_for_tokens(
+        CLAUDE_REFRESH_URL,
+        &code,
+        &code_verifier,
+        &redirect_uri,
+        &state,
+        None,
+    )?;
+    println!("{}", "OK".green());
+
+    finish_claude_oauth(tokens, label)?;
+
+    Ok(())
+}
+
 /// Minimal percent-encoding for URL query parameter values
 fn urlencod(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
@@ -699,7 +911,8 @@ fn urlencod(s: &str) -> String {
 // ─── Codex OAuth PKCE Flow ───
 
 const CODEX_ISSUER: &str = "https://auth.openai.com";
-const CODEX_OAUTH_SCOPES: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
+const CODEX_OAUTH_SCOPES: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
 
 /// Full OAuth PKCE flow for Codex: opens browser, gets tokens, saves profile
 pub fn oauth_codex(label: Option<&str>) -> Result<()> {
@@ -716,7 +929,11 @@ pub fn oauth_codex(label: Option<&str>) -> Result<()> {
     let server = tiny_http::Server::http("localhost:1455")
         .or_else(|_| tiny_http::Server::http("localhost:0"))
         .map_err(|e| anyhow::anyhow!("Failed to start callback server: {}", e))?;
-    let port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(1455);
+    let port = server
+        .server_addr()
+        .to_ip()
+        .map(|a| a.port())
+        .unwrap_or(1455);
     let redirect_uri = format!("http://localhost:{}/auth/callback", port);
 
     // Build authorization URL (matching Codex CLI's exact parameters)
@@ -733,10 +950,16 @@ pub fn oauth_codex(label: Option<&str>) -> Result<()> {
     println!("Opening browser for authentication...");
     println!();
     if open::that(&auth_url).is_err() {
-        println!("{}", "Could not open browser automatically. Open this URL:".yellow());
+        println!(
+            "{}",
+            "Could not open browser automatically. Open this URL:".yellow()
+        );
         println!("  {}", auth_url);
     }
-    println!("{}", "Waiting for OAuth callback (up to 5 minutes)...".dimmed());
+    println!(
+        "{}",
+        "Waiting for OAuth callback (up to 5 minutes)...".dimmed()
+    );
 
     // Wait for callback
     let (code, returned_state) = wait_for_callback(server)?;
@@ -776,7 +999,8 @@ pub fn oauth_codex(label: Option<&str>) -> Result<()> {
         refresh_token: String,
     }
 
-    let tokens: CodexOAuthTokenResponse = token_resp.into_json()
+    let tokens: CodexOAuthTokenResponse = token_resp
+        .into_json()
         .context("Failed to parse Codex token response")?;
     println!("{}", "OK".green());
 
@@ -795,12 +1019,11 @@ pub fn oauth_codex(label: Option<&str>) -> Result<()> {
 
     let identity = extract_codex_identity(&auth_data)?;
 
-    println!("{}", format!("  Account: {} ({})", identity.email, identity.plan).dimmed());
+    println!(
+        "{}",
+        format!("  Account: {} ({})", identity.email, identity.plan).dimmed()
+    );
 
     // Save as profile
-    profiles::save_codex_oauth_profile(
-        auth_data,
-        &identity,
-        label,
-    )
+    profiles::save_codex_oauth_profile(auth_data, &identity, label)
 }

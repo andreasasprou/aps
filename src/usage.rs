@@ -22,6 +22,8 @@ pub struct ClaudeUsageResponse {
     pub seven_day_sonnet: Option<UsageWindow>,
     pub iguana_necktie: Option<UsageWindow>,
     pub extra_usage: Option<ExtraUsage>,
+    #[serde(default)]
+    pub limits: Option<Vec<ClaudeLimitEntry>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -39,6 +41,34 @@ pub struct ExtraUsage {
     pub currency: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct ClaudeLimitEntry {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub percent: Option<f64>,
+    #[serde(default)]
+    pub resets_at: Option<String>,
+    #[serde(default)]
+    pub scope: Option<ClaudeLimitScope>,
+    #[serde(default)]
+    pub is_active: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct ClaudeLimitScope {
+    #[serde(default)]
+    pub model: Option<ClaudeLimitModel>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct ClaudeLimitModel {
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
 fn fetch_claude_usage_once(access_token: &str) -> Result<ClaudeUsageResponse> {
     let delays = [0, 2000, 4000]; // two retries on 429 with increasing backoff
     for (attempt, delay_ms) in delays.iter().enumerate() {
@@ -52,7 +82,11 @@ fn fetch_claude_usage_once(access_token: &str) -> Result<ClaudeUsageResponse> {
             .set("Accept", "application/json")
             .call()
         {
-            Ok(resp) => return resp.into_json().context("Failed to parse Claude usage response"),
+            Ok(resp) => {
+                return resp
+                    .into_json()
+                    .context("Failed to parse Claude usage response")
+            }
             Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
                 anyhow::bail!("token_expired")
             }
@@ -103,7 +137,10 @@ pub struct CodexCredits {
     pub balance: Option<serde_json::Value>,
 }
 
-fn fetch_codex_usage_once(access_token: &str, account_id: Option<&str>) -> Result<CodexUsageResponse> {
+fn fetch_codex_usage_once(
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<CodexUsageResponse> {
     let mut req = ureq::get("https://chatgpt.com/backend-api/wham/usage")
         .set("Authorization", &format!("Bearer {}", access_token))
         .set("Accept", "application/json")
@@ -114,7 +151,9 @@ fn fetch_codex_usage_once(access_token: &str, account_id: Option<&str>) -> Resul
     }
 
     match req.call() {
-        Ok(resp) => resp.into_json().context("Failed to parse Codex usage response"),
+        Ok(resp) => resp
+            .into_json()
+            .context("Failed to parse Codex usage response"),
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
             anyhow::bail!("token_expired")
         }
@@ -165,11 +204,25 @@ fn fetch_codex_usage_with_refresh(
 
 /// What kind of usage to fetch
 enum FetchJob {
-    Claude { access_token: String, refresh_token: Option<String>, profile_id: Option<String>, is_active: bool },
-    Codex { access_token: String, account_id: Option<String>, refresh_token: Option<String>, profile_id: Option<String> },
-    Inactive { message: String },
+    Claude {
+        access_token: String,
+        refresh_token: Option<String>,
+        profile_id: Option<String>,
+        is_active: bool,
+    },
+    Codex {
+        access_token: String,
+        account_id: Option<String>,
+        refresh_token: Option<String>,
+        profile_id: Option<String>,
+    },
+    Inactive {
+        message: String,
+    },
     /// Section divider (not a real fetch)
-    SectionHeader { title: String },
+    SectionHeader {
+        title: String,
+    },
 }
 
 /// Try fetch, refresh token on 401/403, retry
@@ -188,17 +241,30 @@ fn fetch_claude_usage_with_refresh(
                         Ok(refreshed) => {
                             // Persist refreshed tokens to profile
                             if let Some(pid) = profile_id {
-                                let _ = auth::update_claude_profile_tokens(pid, &refreshed);
+                                let _ = auth::persist_refreshed_claude_tokens(pid, &refreshed);
+                                let _ = profiles::set_claude_refresh_failed(pid, false);
                             }
                             fetch_claude_usage_once(&refreshed.access_token)
                         }
-                        Err(refresh_err) => anyhow::bail!(
-                            "Token expired and refresh failed: {}. Re-save with `aps save claude`",
-                            refresh_err
-                        ),
+                        Err(refresh_err) => {
+                            if let Some(pid) = profile_id {
+                                if refresh_err
+                                    .downcast_ref::<auth::ClaudeRefreshError>()
+                                    .is_some_and(|e| e.is_permanent())
+                                {
+                                    let _ = profiles::set_claude_refresh_failed(pid, true);
+                                }
+                            }
+                            anyhow::bail!(
+                                "Token expired and refresh failed: {}. Re-save with `aps save claude`",
+                                refresh_err
+                            )
+                        }
                     }
                 } else {
-                    anyhow::bail!("Token expired (setup token). Generate a new one with `claude setup-token`")
+                    anyhow::bail!(
+                        "Token expired (setup token). Generate a new one with `claude setup-token`"
+                    )
                 }
             } else {
                 Err(e)
@@ -222,6 +288,7 @@ struct ProfileDisplay {
     email: String,
     label: String,
     is_active: bool,
+    refresh_dead: bool,
 }
 
 // ─── Usage Cache ───
@@ -302,18 +369,38 @@ fn status_active_parallel(tools: &[&str]) -> Result<()> {
                         let all_profiles = profiles::get_all_profiles("claude")?;
                         let active = all_profiles.iter().find(|(_, _, a)| *a);
 
-                        let (email, plan, label) = if let Some((_, meta, _)) = active {
-                            (meta.email.clone(), meta.plan.clone(), meta.label.clone().unwrap_or_default())
+                        let (email, plan, label, refresh_dead) = if let Some((_, meta, _)) = active
+                        {
+                            (
+                                meta.email.clone(),
+                                meta.plan.clone(),
+                                meta.label.clone().unwrap_or_default(),
+                                meta.refresh_failed_at.is_some(),
+                            )
                         } else {
-                            ("(unsaved)".into(), "?".into(), String::new())
+                            ("(unsaved)".into(), "?".into(), String::new(), false)
                         };
 
-                        let refresh_token = creds.claude_ai_oauth.as_ref()
+                        let refresh_token = creds
+                            .claude_ai_oauth
+                            .as_ref()
                             .and_then(|o| o.refresh_token.clone());
                         let active_pid = active.map(|(id, _, _)| id.clone());
                         jobs.push((
-                            ProfileDisplay { tool: "claude".into(), plan, email, label, is_active: true },
-                            FetchJob::Claude { access_token: token, refresh_token, profile_id: active_pid, is_active: true },
+                            ProfileDisplay {
+                                tool: "claude".into(),
+                                plan,
+                                email,
+                                label,
+                                is_active: true,
+                                refresh_dead,
+                            },
+                            FetchJob::Claude {
+                                access_token: token,
+                                refresh_token,
+                                profile_id: active_pid,
+                                is_active: true,
+                            },
                         ));
                     } else {
                         println!("  claude: {}", "No active auth".dimmed());
@@ -329,20 +416,49 @@ fn status_active_parallel(tools: &[&str]) -> Result<()> {
                         let all_profiles = profiles::get_all_profiles("codex")?;
                         let active = all_profiles.iter().find(|(_, _, a)| *a);
 
-                        let (email, plan, label, account_id, active_pid) = if let Some((id, meta, _)) = active {
-                            (meta.email.clone(), meta.plan.clone(), meta.label.clone().unwrap_or_default(), meta.account_id.clone(), Some(id.clone()))
-                        } else {
-                            match auth::extract_codex_identity(&auth_data) {
-                                Ok(id) => (id.email, id.plan, String::new(), Some(id.account_id), None),
-                                Err(_) => ("(unknown)".into(), "?".into(), String::new(), None, None),
-                            }
-                        };
+                        let (email, plan, label, account_id, active_pid) =
+                            if let Some((id, meta, _)) = active {
+                                (
+                                    meta.email.clone(),
+                                    meta.plan.clone(),
+                                    meta.label.clone().unwrap_or_default(),
+                                    meta.account_id.clone(),
+                                    Some(id.clone()),
+                                )
+                            } else {
+                                match auth::extract_codex_identity(&auth_data) {
+                                    Ok(id) => (
+                                        id.email,
+                                        id.plan,
+                                        String::new(),
+                                        Some(id.account_id),
+                                        None,
+                                    ),
+                                    Err(_) => {
+                                        ("(unknown)".into(), "?".into(), String::new(), None, None)
+                                    }
+                                }
+                            };
 
-                        let refresh_token = auth_data.tokens.as_ref()
+                        let refresh_token = auth_data
+                            .tokens
+                            .as_ref()
                             .and_then(|t| t.refresh_token.clone());
                         jobs.push((
-                            ProfileDisplay { tool: "codex".into(), plan, email, label, is_active: true },
-                            FetchJob::Codex { access_token: token, account_id, refresh_token, profile_id: active_pid },
+                            ProfileDisplay {
+                                tool: "codex".into(),
+                                plan,
+                                email,
+                                label,
+                                is_active: true,
+                                refresh_dead: false,
+                            },
+                            FetchJob::Codex {
+                                access_token: token,
+                                account_id,
+                                refresh_token,
+                                profile_id: active_pid,
+                            },
                         ));
                     } else {
                         println!("  codex: {}", "No active auth".dimmed());
@@ -382,8 +498,11 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                 email: String::new(),
                 label: String::new(),
                 is_active: false,
+                refresh_dead: false,
             },
-            FetchJob::SectionHeader { title: tool_label.to_string() },
+            FetchJob::SectionHeader {
+                title: tool_label.to_string(),
+            },
         ));
 
         for (id, meta, is_active) in &all_profiles {
@@ -394,6 +513,7 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                 email: meta.email.clone(),
                 label,
                 is_active: *is_active,
+                refresh_dead: tool == "claude" && meta.refresh_failed_at.is_some(),
             };
 
             let data = profiles::read_profile_credentials(tool, id)?;
@@ -404,10 +524,20 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                     // Saved tokens get invalidated when you switch accounts
                     if *is_active {
                         if let Ok(Some(fresh_creds)) = auth::read_claude_credentials() {
-                            let refresh_token = fresh_creds.claude_ai_oauth.as_ref()
+                            let refresh_token = fresh_creds
+                                .claude_ai_oauth
+                                .as_ref()
                                 .and_then(|o| o.refresh_token.clone());
                             if let Some(token) = auth::claude_access_token(&fresh_creds) {
-                                jobs.push((display, FetchJob::Claude { access_token: token, refresh_token, profile_id: Some(id.clone()), is_active: true }));
+                                jobs.push((
+                                    display,
+                                    FetchJob::Claude {
+                                        access_token: token,
+                                        refresh_token,
+                                        profile_id: Some(id.clone()),
+                                        is_active: true,
+                                    },
+                                ));
                                 continue;
                             }
                         }
@@ -416,10 +546,20 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                     // Old tokens often get rate-limited (429) after account switch.
                     let creds: auth::ClaudeCredentialsFile = serde_json::from_slice(&data)
                         .context(format!("Failed to parse profile {}", id))?;
-                    let refresh_token = creds.claude_ai_oauth.as_ref()
+                    let refresh_token = creds
+                        .claude_ai_oauth
+                        .as_ref()
                         .and_then(|o| o.refresh_token.clone());
                     if let Some(token) = auth::claude_access_token(&creds) {
-                        jobs.push((display, FetchJob::Claude { access_token: token, refresh_token, profile_id: Some(id.clone()), is_active: *is_active }));
+                        jobs.push((
+                            display,
+                            FetchJob::Claude {
+                                access_token: token,
+                                refresh_token,
+                                profile_id: Some(id.clone()),
+                                is_active: *is_active,
+                            },
+                        ));
                     } else {
                         jobs.push((display, FetchJob::Inactive {
                             message: "No access token. Run `aps save claude` after switching to this account.".into(),
@@ -430,11 +570,21 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                     // For the active Codex profile, use fresh credentials from auth.json
                     if *is_active {
                         if let Ok(Some(fresh_auth)) = auth::read_codex_auth() {
-                            let refresh_token = fresh_auth.tokens.as_ref()
+                            let refresh_token = fresh_auth
+                                .tokens
+                                .as_ref()
                                 .and_then(|t| t.refresh_token.clone());
                             if let Some(token) = auth::codex_access_token(&fresh_auth) {
                                 let account_id = meta.account_id.clone();
-                                jobs.push((display, FetchJob::Codex { access_token: token, account_id, refresh_token, profile_id: Some(id.clone()) }));
+                                jobs.push((
+                                    display,
+                                    FetchJob::Codex {
+                                        access_token: token,
+                                        account_id,
+                                        refresh_token,
+                                        profile_id: Some(id.clone()),
+                                    },
+                                ));
                                 continue;
                             }
                         }
@@ -442,13 +592,31 @@ fn status_all_parallel(tools: &[&str]) -> Result<()> {
                     // Non-active Codex profiles: use saved token + refresh
                     let auth_data: auth::CodexAuthFile = serde_json::from_slice(&data)
                         .context(format!("Failed to parse profile {}", id))?;
-                    let refresh_token = auth_data.tokens.as_ref()
+                    let refresh_token = auth_data
+                        .tokens
+                        .as_ref()
                         .and_then(|t| t.refresh_token.clone());
                     if let Some(token) = auth::codex_access_token(&auth_data) {
                         let account_id = meta.account_id.clone();
-                        jobs.push((display, FetchJob::Codex { access_token: token, account_id, refresh_token, profile_id: Some(id.clone()) }));
+                        jobs.push((
+                            display,
+                            FetchJob::Codex {
+                                access_token: token,
+                                account_id,
+                                refresh_token,
+                                profile_id: Some(id.clone()),
+                            },
+                        ));
                     } else {
-                        jobs.push((display, FetchJob::Codex { access_token: String::new(), account_id: None, refresh_token: None, profile_id: None }));
+                        jobs.push((
+                            display,
+                            FetchJob::Codex {
+                                access_token: String::new(),
+                                account_id: None,
+                                refresh_token: None,
+                                profile_id: None,
+                            },
+                        ));
                     }
                 }
                 _ => {}
@@ -489,9 +657,17 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
     for (idx, (_display, job)) in jobs.iter().enumerate() {
         let tx = tx.clone();
         match job {
-            FetchJob::Claude { access_token, refresh_token, profile_id, is_active } => {
+            FetchJob::Claude {
+                access_token,
+                refresh_token,
+                profile_id,
+                is_active,
+            } => {
                 if access_token.is_empty() {
-                    let _ = tx.send((idx, FetchResult::Claude(Err(anyhow::anyhow!("No access token")), None)));
+                    let _ = tx.send((
+                        idx,
+                        FetchResult::Claude(Err(anyhow::anyhow!("No access token")), None),
+                    ));
                     continue;
                 }
                 claude_jobs.push(ClaudeJobInfo {
@@ -502,9 +678,17 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                     is_active: *is_active,
                 });
             }
-            FetchJob::Codex { access_token, account_id, refresh_token, profile_id } => {
+            FetchJob::Codex {
+                access_token,
+                account_id,
+                refresh_token,
+                profile_id,
+            } => {
                 if access_token.is_empty() {
-                    let _ = tx.send((idx, FetchResult::Codex(Err(anyhow::anyhow!("No access token")), None)));
+                    let _ = tx.send((
+                        idx,
+                        FetchResult::Codex(Err(anyhow::anyhow!("No access token")), None),
+                    ));
                     continue;
                 }
                 let token = access_token.clone();
@@ -512,7 +696,12 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                 let rt = refresh_token.clone();
                 let pid = profile_id.clone();
                 thread::spawn(move || {
-                    let result = fetch_codex_usage_with_refresh(&token, aid.as_deref(), rt.as_deref(), pid.as_deref());
+                    let result = fetch_codex_usage_with_refresh(
+                        &token,
+                        aid.as_deref(),
+                        rt.as_deref(),
+                        pid.as_deref(),
+                    );
                     let (fetch_result, cache_suffix) = match result {
                         Ok(usage) => {
                             if let Some(ref p) = pid {
@@ -525,7 +714,10 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                             if err_str.contains("rate_limited") {
                                 if let Some(ref p) = pid {
                                     if let Some((cached, suffix)) = read_codex_cache(p) {
-                                        let _ = tx.send((idx, FetchResult::Codex(Ok(cached), Some(suffix))));
+                                        let _ = tx.send((
+                                            idx,
+                                            FetchResult::Codex(Ok(cached), Some(suffix)),
+                                        ));
                                         return;
                                     }
                                 }
@@ -577,7 +769,10 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                         if err_str.contains("rate_limited") {
                             if let Some(ref p) = job.profile_id {
                                 if let Some((cached, suffix)) = read_claude_cache(p) {
-                                    let _ = tx.send((job.idx, FetchResult::Claude(Ok(cached), Some(suffix))));
+                                    let _ = tx.send((
+                                        job.idx,
+                                        FetchResult::Claude(Ok(cached), Some(suffix)),
+                                    ));
                                     continue;
                                 }
                             }
@@ -617,7 +812,10 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
             has_sections = true;
             // Push previous section if any
             if current_section_title.is_some() || !current_section_rows.is_empty() {
-                sections.push((current_section_title.take(), std::mem::take(&mut current_section_rows)));
+                sections.push((
+                    current_section_title.take(),
+                    std::mem::take(&mut current_section_rows),
+                ));
             }
             current_section_title = Some(title.clone());
             continue;
@@ -630,6 +828,7 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
                 email: display.email.clone(),
                 label: display.label.clone(),
                 is_active: display.is_active,
+                refresh_dead: display.refresh_dead,
             },
             result,
         });
@@ -644,7 +843,10 @@ fn fetch_and_display(jobs: Vec<(ProfileDisplay, FetchJob)>) -> Result<()> {
         if let Some(ref t) = title {
             println!();
             let styled_title = match t.as_str() {
-                "Claude Code" => format!("  \u{2500}\u{2500}\u{2500} {}", t.truecolor(217, 119, 87).bold()),
+                "Claude Code" => format!(
+                    "  \u{2500}\u{2500}\u{2500} {}",
+                    t.truecolor(217, 119, 87).bold()
+                ),
                 "Codex" => format!("  \u{2500}\u{2500}\u{2500} {}", t.white().bold()),
                 _ => format!("  \u{2500}\u{2500}\u{2500} {}", t.bold()),
             };
@@ -714,6 +916,7 @@ fn build_dashboard_row(display: &ProfileDisplay, result: &FetchResult) -> ui::Da
         is_active: display.is_active,
         weekly_remaining_pct: None,
         five_hour_remaining_pct: None,
+        scoped_weekly_limits: Vec::new(),
         weekly_reset: String::new(),
         extra_credits: String::new(),
         cache_suffix: String::new(),
@@ -725,14 +928,45 @@ fn build_dashboard_row(display: &ProfileDisplay, result: &FetchResult) -> ui::Da
             // Weekly (7-day) — hero metric
             if let Some(ref w) = usage.seven_day {
                 if let Some(util) = w.utilization {
-                    row.weekly_remaining_pct = Some((100.0 - util.clamp(0.0, 100.0)).round() as u32);
+                    row.weekly_remaining_pct =
+                        Some((100.0 - util.clamp(0.0, 100.0)).round() as u32);
                     row.weekly_reset = format_reset_compact(w.resets_at.as_deref());
                 }
             }
             // 5-hour
             if let Some(ref w) = usage.five_hour {
                 if let Some(util) = w.utilization {
-                    row.five_hour_remaining_pct = Some((100.0 - util.clamp(0.0, 100.0)).round() as u32);
+                    row.five_hour_remaining_pct =
+                        Some((100.0 - util.clamp(0.0, 100.0)).round() as u32);
+                }
+            }
+            // Per-model weekly scoped limits, such as Fable.
+            if let Some(ref limits) = usage.limits {
+                for limit in limits {
+                    if limit.kind.as_deref() != Some("weekly_scoped") {
+                        continue;
+                    }
+                    let Some(ref scope) = limit.scope else {
+                        continue;
+                    };
+                    let Some(ref model) = scope.model else {
+                        continue;
+                    };
+                    let Some(ref display_name) = model.display_name else {
+                        continue;
+                    };
+                    let Some(percent) = limit.percent else {
+                        continue;
+                    };
+                    let trimmed_name = display_name.trim();
+                    if trimmed_name.is_empty() {
+                        continue;
+                    }
+                    row.scoped_weekly_limits.push(ui::ScopedWeeklyLimit {
+                        model_name: trimmed_name.to_string(),
+                        remaining_pct: (100.0 - percent.clamp(0.0, 100.0)).round() as u32,
+                        reset: format_reset_compact(limit.resets_at.as_deref()),
+                    });
                 }
             }
             // Extra credits
@@ -754,8 +988,10 @@ fn build_dashboard_row(display: &ProfileDisplay, result: &FetchResult) -> ui::Da
             if let Some(ref rl) = usage.rate_limit {
                 if let Some(ref w) = rl.secondary_window {
                     if let Some(pct) = w.used_percent {
-                        row.weekly_remaining_pct = Some((100.0 - pct.clamp(0.0, 100.0)).round() as u32);
-                        row.weekly_reset = w.reset_at
+                        row.weekly_remaining_pct =
+                            Some((100.0 - pct.clamp(0.0, 100.0)).round() as u32);
+                        row.weekly_reset = w
+                            .reset_at
                             .map(|ts| format_unix_reset_compact(ts as i64))
                             .unwrap_or_default();
                     }
@@ -763,7 +999,8 @@ fn build_dashboard_row(display: &ProfileDisplay, result: &FetchResult) -> ui::Da
                 // 5-hour (primary window)
                 if let Some(ref w) = rl.primary_window {
                     if let Some(pct) = w.used_percent {
-                        row.five_hour_remaining_pct = Some((100.0 - pct.clamp(0.0, 100.0)).round() as u32);
+                        row.five_hour_remaining_pct =
+                            Some((100.0 - pct.clamp(0.0, 100.0)).round() as u32);
                     }
                 }
             }
@@ -783,37 +1020,61 @@ fn build_dashboard_row(display: &ProfileDisplay, result: &FetchResult) -> ui::Da
         FetchResult::Section(_) => {}
     }
 
+    if display.refresh_dead && !row.error.is_empty() {
+        row.error = format!("refresh dead — {}", row.error);
+    }
+
     row
 }
 
 // ─── Time formatting ───
 
-/// Compact reset time for dashboard rows: "14:00" (today) or "7 Apr" (other day)
+/// Relative time until a reset, for dashboard rows: "in 30 mins", "in 5h",
+/// "in 5h 30m", "in 2 days", "in 12 days 2h". Shows the two largest non-zero units.
+fn format_relative_until(target: DateTime<Local>, now: DateTime<Local>) -> String {
+    let secs = (target - now).num_seconds();
+    if secs <= 0 {
+        return "now".to_string();
+    }
+    let total_mins = secs / 60;
+    let days = total_mins / (60 * 24);
+    let hours = (total_mins % (60 * 24)) / 60;
+    let mins = total_mins % 60;
+
+    if days > 0 {
+        let unit = if days == 1 { "day" } else { "days" };
+        if hours > 0 {
+            format!("in {} {} {}h", days, unit, hours)
+        } else {
+            format!("in {} {}", days, unit)
+        }
+    } else if hours > 0 {
+        if mins > 0 {
+            format!("in {}h {}m", hours, mins)
+        } else {
+            format!("in {}h", hours)
+        }
+    } else {
+        let m = mins.max(1);
+        let unit = if m == 1 { "min" } else { "mins" };
+        format!("in {} {}", m, unit)
+    }
+}
+
+/// Compact reset time for dashboard rows, as a relative duration.
 fn format_reset_compact(iso: Option<&str>) -> String {
     if let Some(s) = iso {
         if let Ok(dt) = s.parse::<DateTime<Utc>>() {
-            let local: DateTime<Local> = dt.into();
-            let now = Local::now();
-            if local.date_naive() == now.date_naive() {
-                return local.format("%H:%M").to_string();
-            } else {
-                return local.format("%-d %b").to_string();
-            }
+            return format_relative_until(dt.into(), Local::now());
         }
     }
     String::new()
 }
 
-/// Compact reset time from unix timestamp
+/// Compact reset time from unix timestamp, as a relative duration.
 fn format_unix_reset_compact(ts: i64) -> String {
     if let Some(dt) = DateTime::from_timestamp(ts, 0) {
-        let local: DateTime<Local> = dt.into();
-        let now = Local::now();
-        if local.date_naive() == now.date_naive() {
-            return local.format("%H:%M").to_string();
-        } else {
-            return local.format("%-d %b").to_string();
-        }
+        return format_relative_until(dt.into(), Local::now());
     }
     String::new()
 }

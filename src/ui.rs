@@ -62,10 +62,16 @@ pub fn render_usage_bar(label: &str, utilization: f64, resets_at: &str, indent: 
 
 /// Render a profile header badge like codex-profiles
 pub fn render_profile_header(plan: &str, email: &str, label: &str, is_active: bool) {
-    let plan_badge = format!(" {} ", plan.to_uppercase()).on_yellow().black().bold();
+    let plan_badge = format!(" {} ", plan.to_uppercase())
+        .on_yellow()
+        .black()
+        .bold();
     let email_display = format!("  {}  ", email).on_bright_black().white();
     let label_display = if !label.is_empty() {
-        format!("  {}  ", label).on_bright_black().white().to_string()
+        format!("  {}  ", label)
+            .on_bright_black()
+            .white()
+            .to_string()
     } else {
         String::new()
     };
@@ -91,6 +97,7 @@ pub fn render_profile_header_with_tool(
     email: &str,
     label: &str,
     is_active: bool,
+    refresh_dead: bool,
 ) {
     // Claude = Anthropic brand terracotta #D97757, Codex = yellow
     let plan_badge = match tool {
@@ -105,7 +112,10 @@ pub fn render_profile_header_with_tool(
     };
     let email_display = format!("  {}  ", email).on_bright_black().white();
     let label_display = if !label.is_empty() {
-        format!("  {}  ", label).on_bright_black().white().to_string()
+        format!("  {}  ", label)
+            .on_bright_black()
+            .white()
+            .to_string()
     } else {
         String::new()
     };
@@ -116,20 +126,23 @@ pub fn render_profile_header_with_tool(
                 .truecolor(217, 119, 87)
                 .bold()
                 .to_string(),
-            _ => format!("  <- active ({})", tool)
-                .green()
-                .bold()
-                .to_string(),
+            _ => format!("  <- active ({})", tool).green().bold().to_string(),
         };
         marker_text
     } else {
         String::new()
     };
 
+    let refresh_dead_marker = if refresh_dead {
+        " !refresh-dead".red().bold().to_string()
+    } else {
+        String::new()
+    };
+
     println!();
     println!(
-        "  {}{}{}{}",
-        plan_badge, email_display, label_display, active_marker
+        "  {}{}{}{}{}",
+        plan_badge, email_display, label_display, refresh_dead_marker, active_marker
     );
     println!();
 }
@@ -158,9 +171,9 @@ impl UsageTier {
     /// Status glyph for this tier
     pub fn glyph(&self) -> String {
         match self {
-            UsageTier::Green => "\u{25CF}".truecolor(34, 197, 94).to_string(),  // ●
+            UsageTier::Green => "\u{25CF}".truecolor(34, 197, 94).to_string(), // ●
             UsageTier::Yellow => "\u{25D0}".truecolor(234, 179, 8).to_string(), // ◐
-            UsageTier::Red => "\u{25CB}".truecolor(239, 68, 68).to_string(),    // ○
+            UsageTier::Red => "\u{25CB}".truecolor(239, 68, 68).to_string(),   // ○
         }
     }
 
@@ -185,6 +198,8 @@ pub struct DashboardRow {
     pub weekly_remaining_pct: Option<u32>,
     /// 5h remaining as 0-100 percentage. None if unknown.
     pub five_hour_remaining_pct: Option<u32>,
+    /// Per-model scoped weekly remaining limits.
+    pub scoped_weekly_limits: Vec<ScopedWeeklyLimit>,
     /// Weekly reset time string (compact). Empty if unknown.
     pub weekly_reset: String,
     /// Extra credits suffix, e.g. "+$200". Empty if none.
@@ -195,12 +210,18 @@ pub struct DashboardRow {
     pub error: String,
 }
 
+pub struct ScopedWeeklyLimit {
+    pub model_name: String,
+    pub remaining_pct: u32,
+    pub reset: String,
+}
+
 /// Build a colored bar of given width from a remaining percentage
 fn build_bar(remaining_pct: u32, width: usize, tier: Option<UsageTier>) -> String {
     let filled = ((remaining_pct as f64 / 100.0) * width as f64).round() as usize;
     let empty = width - filled;
     let filled_str = "\u{2588}".repeat(filled); // █
-    let empty_str = "\u{2591}".repeat(empty);   // ░
+    let empty_str = "\u{2591}".repeat(empty); // ░
 
     if let Some(t) = tier {
         format!("{}{}", t.color_str(&filled_str), empty_str.dimmed())
@@ -212,6 +233,47 @@ fn build_bar(remaining_pct: u32, width: usize, tier: Option<UsageTier>) -> Strin
             empty_str.dimmed()
         )
     }
+}
+
+fn build_weekly_bar_cell(remaining_pct: u32, width: usize) -> String {
+    let tier = UsageTier::from_remaining_pct(remaining_pct);
+    let bar = build_bar(remaining_pct, width, Some(tier));
+    let pct_str = format!("{:>3}%", remaining_pct);
+    format!("{} {}", bar, tier.color_str(&pct_str))
+}
+
+fn build_plain_bar_cell(remaining_pct: u32, width: usize) -> String {
+    let filled = ((remaining_pct as f64 / 100.0) * width as f64).round() as usize;
+    let empty = width - filled;
+    let filled_str = "\u{2588}".repeat(filled);
+    let empty_str = "\u{2591}".repeat(empty);
+    format!("{}{} {:>3}%", filled_str, empty_str, remaining_pct)
+}
+
+fn scoped_model_key(model_name: &str) -> String {
+    model_name.to_lowercase()
+}
+
+fn collect_scoped_model_names(rows: &[DashboardRow]) -> Vec<String> {
+    let mut names = Vec::new();
+    for row in rows {
+        for limit in &row.scoped_weekly_limits {
+            let name = scoped_model_key(&limit.model_name);
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+fn scoped_limit_for_header<'a>(
+    row: &'a DashboardRow,
+    header: &str,
+) -> Option<&'a ScopedWeeklyLimit> {
+    row.scoped_weekly_limits
+        .iter()
+        .find(|limit| scoped_model_key(&limit.model_name) == header)
 }
 
 /// Render a single dashboard row to stdout
@@ -226,7 +288,11 @@ pub fn render_dashboard_row(row: &DashboardRow) {
     // 2. Plan badge
     let plan_text = format!(" {} ", row.plan.to_uppercase());
     let plan_badge = match row.tool.as_str() {
-        "claude" => plan_text.on_truecolor(217, 119, 87).white().bold().to_string(),
+        "claude" => plan_text
+            .on_truecolor(217, 119, 87)
+            .white()
+            .bold()
+            .to_string(),
         _ => plan_text.on_yellow().black().bold().to_string(),
     };
 
@@ -234,7 +300,11 @@ pub fn render_dashboard_row(row: &DashboardRow) {
     let display_name = if !row.label.is_empty() {
         row.label.clone()
     } else {
-        row.email.split('@').next().unwrap_or(&row.email).to_string()
+        row.email
+            .split('@')
+            .next()
+            .unwrap_or(&row.email)
+            .to_string()
     };
     let name_padded = format!("{:<12}", display_name);
 
@@ -247,14 +317,41 @@ pub fn render_dashboard_row(row: &DashboardRow) {
 
     // 5. Weekly bar (12 chars wide) — hero metric, with percentage
     let weekly_bar = if row.error.is_empty() {
-        let bar = build_bar(weekly_pct, 12, Some(tier));
-        let pct_str = format!("{:>3}%", weekly_pct);
-        format!("{} {}", bar, tier.color_str(&pct_str))
+        build_weekly_bar_cell(weekly_pct, 12)
     } else {
         " ".repeat(17) // 12 bar + 1 space + 4 pct
     };
 
-    // 6. 5h bar (8 chars wide) — neutral slate, with percentage
+    // 6. Scoped weekly bars
+    let scoped_bars = if row.error.is_empty() {
+        row.scoped_weekly_limits
+            .iter()
+            .map(|limit| {
+                let reset = if limit.reset.is_empty() {
+                    String::new()
+                } else {
+                    let reset_text = format!("({})", limit.reset);
+                    format!(" {}", reset_text.dimmed())
+                };
+                format!(
+                    "{} {}{}",
+                    scoped_model_key(&limit.model_name).dimmed(),
+                    build_weekly_bar_cell(limit.remaining_pct, 12),
+                    reset
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        String::new()
+    };
+    let scoped_segment = if scoped_bars.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", scoped_bars)
+    };
+
+    // 7. 5h bar (8 chars wide) — neutral slate, with percentage
     let five_hour_pct = row.five_hour_remaining_pct.unwrap_or(100);
     let five_hour_bar = if row.error.is_empty() {
         let bar = build_bar(five_hour_pct, 8, None);
@@ -264,14 +361,14 @@ pub fn render_dashboard_row(row: &DashboardRow) {
         " ".repeat(13) // 8 bar + 1 space + 4 pct
     };
 
-    // 7. Reset time
+    // 8. Reset time
     let reset_display = if !row.weekly_reset.is_empty() && row.error.is_empty() {
         format!("resets {}", row.weekly_reset).dimmed().to_string()
     } else {
         String::new()
     };
 
-    // 8. Active marker
+    // 9. Active marker
     let active_marker = if row.is_active {
         match row.tool.as_str() {
             "claude" => "<- active".truecolor(217, 119, 87).bold().to_string(),
@@ -281,14 +378,14 @@ pub fn render_dashboard_row(row: &DashboardRow) {
         String::new()
     };
 
-    // 9. Extra credits
+    // 10. Extra credits
     let credits_display = if !row.extra_credits.is_empty() {
         row.extra_credits.dimmed().to_string()
     } else {
         String::new()
     };
 
-    // 10. Cache suffix
+    // 11. Cache suffix
     let cache_display = if !row.cache_suffix.is_empty() {
         row.cache_suffix.dimmed().to_string()
     } else {
@@ -334,12 +431,13 @@ pub fn render_dashboard_row(row: &DashboardRow) {
     };
 
     let line = format!(
-        "  {}  {}  {}  {} {} {}{}",
+        "  {}  {}  {}  {} {}{} {}{}",
         glyph,
         plan_badge,
         name_padded,
         email_display.dimmed(),
         weekly_bar,
+        scoped_segment,
         five_hour_bar,
         suffix_str,
     );
@@ -355,7 +453,11 @@ pub fn render_dashboard_row(row: &DashboardRow) {
             format!("{} {}", "\u{2591}".repeat(12), 0),
             format!("{}", "\u{2591}".repeat(8)),
             five_hour_pct,
-            if suffixes.is_empty() { String::new() } else { format!("  {}", row.weekly_reset) },
+            if suffixes.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", row.weekly_reset)
+            },
         );
         println!("{}", line_plain.dimmed());
     } else {
@@ -371,16 +473,22 @@ pub fn build_status_table(rows: &[DashboardRow]) -> String {
         .load_preset(presets::NOTHING)
         .set_content_arrangement(ContentArrangement::Dynamic);
 
+    let scoped_model_names = collect_scoped_model_names(rows);
+
     // Column header row
-    table.add_row(vec![
-        Cell::new(""),                                               // glyph
-        Cell::new(""),                                               // plan badge
-        Cell::new(""),                                               // name
-        Cell::new(""),                                               // email
-        Cell::new(format!("{}", "weekly".dimmed())),                  // weekly bar+pct
-        Cell::new(format!("{}", "5 hour".dimmed())),                 // 5h bar+pct
-        Cell::new(""),                                               // suffixes
-    ]);
+    let mut header_cells = vec![
+        Cell::new(""),                               // glyph
+        Cell::new(""),                               // plan badge
+        Cell::new(""),                               // name
+        Cell::new(""),                               // email
+        Cell::new(format!("{}", "weekly".dimmed())), // weekly bar+pct
+    ];
+    for model_name in &scoped_model_names {
+        header_cells.push(Cell::new(format!("{}", model_name.as_str().dimmed())));
+    }
+    header_cells.push(Cell::new(format!("{}", "5 hour".dimmed()))); // 5h bar+pct
+    header_cells.push(Cell::new("")); // suffixes
+    table.add_row(header_cells);
 
     for row in rows {
         let weekly_pct = row.weekly_remaining_pct.unwrap_or(0);
@@ -393,7 +501,11 @@ pub fn build_status_table(rows: &[DashboardRow]) -> String {
         // 2. Plan badge
         let plan_text = format!(" {} ", row.plan.to_uppercase());
         let plan_badge = match row.tool.as_str() {
-            "claude" => plan_text.on_truecolor(217, 119, 87).white().bold().to_string(),
+            "claude" => plan_text
+                .on_truecolor(217, 119, 87)
+                .white()
+                .bold()
+                .to_string(),
             _ => plan_text.on_yellow().black().bold().to_string(),
         };
 
@@ -401,7 +513,11 @@ pub fn build_status_table(rows: &[DashboardRow]) -> String {
         let display_name = if !row.label.is_empty() {
             row.label.clone()
         } else {
-            row.email.split('@').next().unwrap_or(&row.email).to_string()
+            row.email
+                .split('@')
+                .next()
+                .unwrap_or(&row.email)
+                .to_string()
         };
 
         // 4. Email
@@ -416,35 +532,48 @@ pub fn build_status_table(rows: &[DashboardRow]) -> String {
                 row.error.clone()
             };
             if depleted {
-                table.add_row(vec![
+                let mut cells = vec![
                     Cell::new(format!("{}", glyph.dimmed())),
                     Cell::new(format!("{}", plan_badge.dimmed())),
                     Cell::new(format!("{}", display_name.dimmed())),
                     Cell::new(format!("{}", row.email.dimmed())),
                     Cell::new(""),
-                    Cell::new(""),
-                    Cell::new(format!("{}", err_short.red().dimmed())),
-                ]);
+                ];
+                for _ in &scoped_model_names {
+                    cells.push(Cell::new(""));
+                }
+                cells.push(Cell::new(""));
+                cells.push(Cell::new(format!("{}", err_short.red().dimmed())));
+                table.add_row(cells);
             } else {
-                table.add_row(vec![
+                let mut cells = vec![
                     Cell::new(&glyph),
                     Cell::new(&plan_badge),
                     Cell::new(&display_name),
                     Cell::new(&email_display),
                     Cell::new(""),
-                    Cell::new(""),
-                    Cell::new(format!("{}", err_short.red())),
-                ]);
+                ];
+                for _ in &scoped_model_names {
+                    cells.push(Cell::new(""));
+                }
+                cells.push(Cell::new(""));
+                cells.push(Cell::new(format!("{}", err_short.red())));
+                table.add_row(cells);
             }
             continue;
         }
 
         // 5. Weekly bar
-        let weekly_bar_cell = {
-            let bar = build_bar(weekly_pct, 12, Some(tier));
-            let pct_str = format!("{:>3}%", weekly_pct);
-            format!("{} {}", bar, tier.color_str(&pct_str))
-        };
+        let weekly_bar_cell = build_weekly_bar_cell(weekly_pct, 12);
+
+        let scoped_bar_cells: Vec<String> = scoped_model_names
+            .iter()
+            .map(|model_name| {
+                scoped_limit_for_header(row, model_name)
+                    .map(|limit| build_weekly_bar_cell(limit.remaining_pct, 12))
+                    .unwrap_or_default()
+            })
+            .collect();
 
         // 6. 5h bar
         let five_hour_pct = row.five_hour_remaining_pct.unwrap_or(100);
@@ -476,40 +605,46 @@ pub fn build_status_table(rows: &[DashboardRow]) -> String {
 
         if depleted {
             // Fully dimmed row
-            let dim_weekly = format!(
-                "{} {:>3}%",
-                "\u{2591}".repeat(12),
-                0
-            );
-            let dim_5h = format!(
-                "{} {:>3}%",
-                "\u{2591}".repeat(8),
-                five_hour_pct
-            );
+            let dim_weekly = format!("{} {:>3}%", "\u{2591}".repeat(12), 0);
+            let dim_5h = format!("{} {:>3}%", "\u{2591}".repeat(8), five_hour_pct);
             let dim_suffix = if !row.weekly_reset.is_empty() {
                 format!("resets {}", row.weekly_reset)
             } else {
                 String::new()
             };
-            table.add_row(vec![
+            let mut cells = vec![
                 Cell::new(format!("{}", "\u{25CB}".dimmed())),
-                Cell::new(format!("{}", format!(" {} ", row.plan.to_uppercase()).dimmed())),
+                Cell::new(format!(
+                    "{}",
+                    format!(" {} ", row.plan.to_uppercase()).dimmed()
+                )),
                 Cell::new(format!("{}", display_name.dimmed())),
                 Cell::new(format!("{}", row.email.dimmed())),
                 Cell::new(format!("{}", dim_weekly.dimmed())),
-                Cell::new(format!("{}", dim_5h.dimmed())),
-                Cell::new(format!("{}", dim_suffix.dimmed())),
-            ]);
+            ];
+            for model_name in &scoped_model_names {
+                let dim_scoped = scoped_limit_for_header(row, model_name)
+                    .map(|limit| build_plain_bar_cell(limit.remaining_pct, 12))
+                    .unwrap_or_default();
+                cells.push(Cell::new(format!("{}", dim_scoped.dimmed())));
+            }
+            cells.push(Cell::new(format!("{}", dim_5h.dimmed())));
+            cells.push(Cell::new(format!("{}", dim_suffix.dimmed())));
+            table.add_row(cells);
         } else {
-            table.add_row(vec![
+            let mut cells = vec![
                 Cell::new(&glyph),
                 Cell::new(&plan_badge),
                 Cell::new(&display_name),
                 Cell::new(&email_display),
                 Cell::new(&weekly_bar_cell),
-                Cell::new(&five_hour_bar_cell),
-                Cell::new(&suffix_str),
-            ]);
+            ];
+            for scoped_cell in &scoped_bar_cells {
+                cells.push(Cell::new(scoped_cell));
+            }
+            cells.push(Cell::new(&five_hour_bar_cell));
+            cells.push(Cell::new(&suffix_str));
+            table.add_row(cells);
         }
     }
 
