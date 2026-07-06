@@ -43,7 +43,9 @@ fn main() {
         Commands::Doctor => profiles::doctor(),
         Commands::Auth { command } => match command {
             AuthCommands::Claude { label, manual } => auth::oauth_claude(label.as_deref(), manual),
-            AuthCommands::Codex { label } => auth::oauth_codex(label.as_deref()),
+            AuthCommands::Codex { label, device_auth } => {
+                auth::oauth_codex(label.as_deref(), device_auth)
+            }
         },
     };
 

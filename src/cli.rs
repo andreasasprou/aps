@@ -91,11 +91,14 @@ pub enum AuthCommands {
         #[arg(long)]
         manual: bool,
     },
-    /// Authenticate with Codex via OAuth PKCE (opens browser)
+    /// Authenticate with Codex via OAuth PKCE
     Codex {
         /// Optional label for the saved profile
         #[arg(long, short)]
         label: Option<String>,
+        /// Use device-code auth for headless/SSH machines
+        #[arg(long)]
+        device_auth: bool,
     },
 }
 

@@ -62,13 +62,16 @@ Profiles with a dead refresh token show a red `!refresh-dead` marker in `aps lis
 
 Opens your browser for OAuth — gives full-scope tokens with 1-year expiry and auto-refresh:
 
-On headless or SSH machines where the browser callback cannot reach localhost, use `--manual` to paste the authorization code instead:
+On headless or SSH machines where the browser callback cannot reach localhost, use `--manual` for Claude or `--device-auth` for Codex:
 
 ```bash
 aps auth claude --manual --label work
+aps auth codex --device-auth --label work
 ```
 
-It prints the authorization URL and waits for you to paste back the `code#state` value. The URL is long, so press `c` at the prompt to copy it to your local clipboard (via the OSC 52 terminal escape — works in most terminals; inside tmux needs `set-clipboard on`).
+Claude manual auth prints the authorization URL and waits for you to paste back the `code#state` value. The URL is long, so press `c` at the prompt to copy it to your local clipboard (via the OSC 52 terminal escape — works in most terminals; inside tmux needs `set-clipboard on`).
+
+Codex device auth prints a browser URL and one-time code, then polls until the login is approved.
 
 ```bash
 # Claude accounts
@@ -79,6 +82,7 @@ aps auth claude --label personal
 # Codex accounts
 aps auth codex --label dweet
 aps auth codex --label work
+aps auth codex --device-auth --label devbox
 ```
 
 ### Or save from existing credentials
@@ -113,7 +117,7 @@ aps status --all   # All profiles, sorted by availability
 
 ```
 aps auth claude [--label NAME] [--manual]  Authenticate via OAuth (opens browser)
-aps auth codex [--label NAME]            Authenticate via OAuth (opens browser)
+aps auth codex [--label NAME] [--device-auth] Authenticate via OAuth or device code
 aps save <claude|codex>                  Save current auth as a profile
 aps save claude --from-token <TOKEN>     Save from a setup token
 aps save claude --from-refresh-token <T> Save from a refresh token
@@ -133,7 +137,7 @@ aps doctor                               Run diagnostics
 ## How it works
 
 **Authentication:**
-- `aps auth` runs a full OAuth PKCE flow — opens your browser, gets tokens with all scopes, saves the profile. Each auth creates an independent session that doesn't interfere with other machines. Use `aps auth claude --manual` on headless/SSH machines to paste the authorization code instead.
+- `aps auth` runs a full OAuth PKCE flow — opens your browser, gets tokens with all scopes, saves the profile. Each auth creates an independent session that doesn't interfere with other machines. Use `aps auth claude --manual` or `aps auth codex --device-auth` on headless/SSH machines.
 - `aps save` captures whatever's currently active in Claude Code / Codex.
 - `aps load` writes credentials to both the macOS Keychain and `~/.claude/.credentials.json` (Claude) or `~/.codex/auth.json` (Codex).
 

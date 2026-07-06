@@ -914,8 +914,223 @@ const CODEX_ISSUER: &str = "https://auth.openai.com";
 const CODEX_OAUTH_SCOPES: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
 
-/// Full OAuth PKCE flow for Codex: opens browser, gets tokens, saves profile
-pub fn oauth_codex(label: Option<&str>) -> Result<()> {
+#[derive(Debug, Deserialize)]
+struct CodexOAuthTokenResponse {
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexDeviceUserCodeResponse {
+    device_auth_id: String,
+    #[serde(alias = "user_code", alias = "usercode")]
+    user_code: String,
+    #[serde(default)]
+    interval: Option<serde_json::Value>,
+}
+
+impl CodexDeviceUserCodeResponse {
+    fn poll_interval_secs(&self) -> u64 {
+        match self.interval.as_ref() {
+            Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(5).max(1),
+            Some(serde_json::Value::String(s)) => s.trim().parse::<u64>().unwrap_or(5).max(1),
+            _ => 5,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexDeviceTokenResponse {
+    authorization_code: String,
+    code_verifier: String,
+}
+
+fn exchange_codex_authorization_code(
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+) -> Result<CodexOAuthTokenResponse> {
+    // Codex uses form-urlencoded for token exchange (not JSON).
+    let token_body = format!(
+        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
+        urlencod(code),
+        urlencod(redirect_uri),
+        urlencod(CODEX_CLIENT_ID),
+        urlencod(code_verifier),
+    );
+
+    let token_resp = match ureq::post(&format!("{}/oauth/token", CODEX_ISSUER))
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .send_string(&token_body)
+    {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            anyhow::bail!("Token exchange failed (HTTP {}): {}", code, body);
+        }
+        Err(e) => return Err(e).context("Failed to exchange authorization code"),
+    };
+
+    token_resp
+        .into_json()
+        .context("Failed to parse Codex token response")
+}
+
+fn finish_codex_oauth(tokens: CodexOAuthTokenResponse, label: Option<&str>) -> Result<()> {
+    use colored::Colorize;
+
+    let auth_data = CodexAuthFile {
+        auth_mode: Some("chatgpt".into()),
+        openai_api_key: None,
+        tokens: Some(CodexTokens {
+            id_token: Some(tokens.id_token),
+            access_token: Some(tokens.access_token),
+            refresh_token: Some(tokens.refresh_token),
+            account_id: None,
+        }),
+        last_refresh: Some(chrono::Utc::now().to_rfc3339()),
+    };
+
+    let identity = extract_codex_identity(&auth_data)?;
+
+    println!(
+        "{}",
+        format!("  Account: {} ({})", identity.email, identity.plan).dimmed()
+    );
+
+    profiles::save_codex_oauth_profile(auth_data, &identity, label)
+}
+
+fn codex_device_request_user_code() -> Result<CodexDeviceUserCodeResponse> {
+    let url = format!("{}/api/accounts/deviceauth/usercode", CODEX_ISSUER);
+    let body = serde_json::json!({
+        "client_id": CODEX_CLIENT_ID,
+    });
+
+    match ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+    {
+        Ok(resp) => resp
+            .into_json()
+            .context("Failed to parse Codex device-code response"),
+        Err(ureq::Error::Status(404, _)) => {
+            anyhow::bail!(
+                "Codex device auth is not enabled for this server/account. Use browser login or enable device code authentication."
+            )
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            if body.trim().is_empty() {
+                anyhow::bail!("Codex device-code request failed (HTTP {})", code);
+            }
+            anyhow::bail!("Codex device-code request failed (HTTP {}): {}", code, body);
+        }
+        Err(e) => Err(e).context("Failed to request Codex device code"),
+    }
+}
+
+fn codex_device_poll_for_token(
+    device_auth_id: &str,
+    user_code: &str,
+    interval_secs: u64,
+) -> Result<CodexDeviceTokenResponse> {
+    let url = format!("{}/api/accounts/deviceauth/token", CODEX_ISSUER);
+    let max_wait = std::time::Duration::from_secs(15 * 60);
+    let start = std::time::Instant::now();
+
+    loop {
+        let body = serde_json::json!({
+            "device_auth_id": device_auth_id,
+            "user_code": user_code,
+        });
+
+        match ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string())
+        {
+            Ok(resp) => {
+                return resp
+                    .into_json()
+                    .context("Failed to parse Codex device-token response");
+            }
+            Err(ureq::Error::Status(403 | 404, _)) => {
+                let elapsed = start.elapsed();
+                if elapsed >= max_wait {
+                    anyhow::bail!("Codex device auth timed out after 15 minutes");
+                }
+                let sleep_for =
+                    std::time::Duration::from_secs(interval_secs).min(max_wait - elapsed);
+                std::thread::sleep(sleep_for);
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                if body.trim().is_empty() {
+                    anyhow::bail!("Codex device auth failed (HTTP {})", code);
+                }
+                anyhow::bail!("Codex device auth failed (HTTP {}): {}", code, body);
+            }
+            Err(e) => return Err(e).context("Failed while polling Codex device auth"),
+        }
+    }
+}
+
+fn oauth_codex_device(label: Option<&str>) -> Result<()> {
+    use colored::Colorize;
+
+    println!("{}", "Starting Codex device authentication...".bold());
+    println!();
+
+    print!("{}", "Requesting device code... ".dimmed());
+    let device_code = codex_device_request_user_code()?;
+    println!("{}", "OK".green());
+    println!();
+
+    println!("Open this URL in a browser and sign in:");
+    println!("  {}", format!("{}/codex/device", CODEX_ISSUER).blue());
+    println!();
+    println!("Enter this one-time code:");
+    println!("  {}", device_code.user_code.blue().bold());
+    println!();
+    println!(
+        "{}",
+        "Device codes expire in 15 minutes. Never share this code.".dimmed()
+    );
+    println!(
+        "{}",
+        "Waiting for device authorization (up to 15 minutes)...".dimmed()
+    );
+
+    let code_resp = codex_device_poll_for_token(
+        &device_code.device_auth_id,
+        &device_code.user_code,
+        device_code.poll_interval_secs(),
+    )?;
+
+    println!();
+    print!("{}", "Exchanging code for tokens... ".dimmed());
+    let redirect_uri = format!("{}/deviceauth/callback", CODEX_ISSUER);
+    let tokens = exchange_codex_authorization_code(
+        &code_resp.authorization_code,
+        &code_resp.code_verifier,
+        &redirect_uri,
+    )?;
+    println!("{}", "OK".green());
+
+    finish_codex_oauth(tokens, label)
+}
+
+/// Full OAuth flow for Codex: browser callback or device code, gets tokens, saves profile.
+pub fn oauth_codex(label: Option<&str>, device_auth: bool) -> Result<()> {
+    if device_auth {
+        return oauth_codex_device(label);
+    }
+
+    oauth_codex_browser(label)
+}
+
+fn oauth_codex_browser(label: Option<&str>) -> Result<()> {
     use colored::Colorize;
 
     println!("{}", "Starting Codex OAuth authentication...".bold());
@@ -970,60 +1185,8 @@ pub fn oauth_codex(label: Option<&str>) -> Result<()> {
 
     println!();
     print!("{}", "Exchanging code for tokens... ".dimmed());
-
-    // Codex uses form-urlencoded for token exchange (not JSON)
-    let token_body = format!(
-        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
-        urlencod(&code),
-        urlencod(&redirect_uri),
-        urlencod(CODEX_CLIENT_ID),
-        urlencod(&code_verifier),
-    );
-
-    let token_resp = match ureq::post(&format!("{}/oauth/token", CODEX_ISSUER))
-        .set("Content-Type", "application/x-www-form-urlencoded")
-        .send_string(&token_body)
-    {
-        Ok(resp) => resp,
-        Err(ureq::Error::Status(code, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
-            anyhow::bail!("Token exchange failed (HTTP {}): {}", code, body);
-        }
-        Err(e) => return Err(e).context("Failed to exchange authorization code"),
-    };
-
-    #[derive(Debug, Deserialize)]
-    struct CodexOAuthTokenResponse {
-        id_token: String,
-        access_token: String,
-        refresh_token: String,
-    }
-
-    let tokens: CodexOAuthTokenResponse = token_resp
-        .into_json()
-        .context("Failed to parse Codex token response")?;
+    let tokens = exchange_codex_authorization_code(&code, &code_verifier, &redirect_uri)?;
     println!("{}", "OK".green());
 
-    // Extract identity from id_token JWT
-    let auth_data = CodexAuthFile {
-        auth_mode: Some("chatgpt".into()),
-        openai_api_key: None,
-        tokens: Some(CodexTokens {
-            id_token: Some(tokens.id_token),
-            access_token: Some(tokens.access_token),
-            refresh_token: Some(tokens.refresh_token),
-            account_id: None, // will be extracted from JWT below
-        }),
-        last_refresh: Some(chrono::Utc::now().to_rfc3339()),
-    };
-
-    let identity = extract_codex_identity(&auth_data)?;
-
-    println!(
-        "{}",
-        format!("  Account: {} ({})", identity.email, identity.plan).dimmed()
-    );
-
-    // Save as profile
-    profiles::save_codex_oauth_profile(auth_data, &identity, label)
+    finish_codex_oauth(tokens, label)
 }
